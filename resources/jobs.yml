@@ -1,0 +1,78 @@
+resources:
+  jobs:
+    abac_migration_job:
+      name: "ABAC Migration Utility"
+      description: >-
+        Converts legacy Unity Catalog row filters / column masks to
+        attribute-based (ABAC) row-filter and column-mask policies.
+        Defaults to a safe, read-only INVENTORY dry run scoped to
+        `catalogs` (SELECTED_CATALOGS) - deliberately not ALL_CATALOGS:
+        confirmed live that also crawls Databricks-managed `system`/
+        `samples` catalogs, which are neither migratable nor relevant and
+        can turn a minutes-long inventory into an hours-long one. Override
+        `mode` (INVENTORY | MIGRATE | INVENTORY_AND_MIGRATE | VERIFY |
+        RECONCILE | ROLLBACK), `scope_type`/`catalogs`/`schemas`/`tables`,
+        and `dry_run` at run time ("Run now with different parameters") to
+        actually migrate a given scope. (Permission-denied and sample-table
+        securables encountered under ALL_CATALOGS/ALL_SCHEMAS are still
+        skipped gracefully rather than aborting the run, if you do use them.)
+      max_concurrent_runs: 1
+      # Serverless job compute: the notebook only makes Python/requests
+      # calls against the SQL Statement Execution API, so it needs no
+      # Spark cluster at all - this also sidesteps classic-cluster VM/SKU
+      # stockout risk entirely.
+      tasks:
+        - task_key: run_migration
+          notebook_task:
+            notebook_path: ../notebooks/abac_migration_run.py
+            base_parameters:
+              warehouse_id: ${var.warehouse_id}
+              mode: "INVENTORY"
+              scope_type: "SELECTED_CATALOGS"
+              catalogs: ${var.catalogs_json}
+              exclude_schema_regex: "^information_schema$"
+              dry_run: "true"
+              continue_on_error: "true"
+              max_parallelism: "4"
+              audit_catalog: ${var.audit_catalog}
+              audit_schema: ${var.audit_schema}
+              policy_strategy: "TABLE_BASED"
+              prefer_existing_tags: "true"
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+            dependencies:
+              - ../dist/*.whl
+
+    abac_migration_full_e2e_test_job:
+      name: "ABAC Migration Utility - Full E2E Scenario Test"
+      description: >-
+        Exercises every migration scenario (dry run, real migration,
+        idempotent rerun, VERIFY, drift detection/RECONCILE, ROLLBACK) end
+        to end against the sales_abac_demo fixtures plus the dedicated
+        abac_migration_scenario_tests edge-case fixtures
+        (abac_migration/spike/setup_scenario_tests.py). Intended for the
+        `source` target/workspace where those fixtures were created during
+        development - not a fresh workspace.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: run_full_e2e_test
+          notebook_task:
+            notebook_path: ../notebooks/abac_migration_full_e2e_test.py
+            base_parameters:
+              warehouse_id: ${var.warehouse_id}
+              audit_catalog: ${var.audit_catalog}
+              audit_schema: ${var.audit_schema}
+              demo_schema: "sales_abac_demo"
+              demo_catalogs: '["ril_raw","ril_curated","ril_bulk","ril_migration","ril_sandbox"]'
+              scenario_tests_schema: "abac_migration_scenario_tests"
+              rollback_demo_table: "rollback_demo_tbl"
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+            dependencies:
+              - ../dist/*.whl

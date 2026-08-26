@@ -1,0 +1,93 @@
+# Databricks Asset Bundle for the ABAC Migration Utility.
+#
+# Deploys:
+#   - The `abac_migration` Python package, built as a wheel (see setup.py)
+#     and attached as a job library - this replaces the manual
+#     "upload package to workspace files" step used during development
+#     (abac_migration/spike/upload_package_to_workspace.py).
+#   - `abac_migration_job`          - the production-facing, parameterized
+#                                     ATOMIC migration job (INVENTORY/MIGRATE/
+#                                     INVENTORY_AND_MIGRATE/VERIFY/RECONCILE/
+#                                     ROLLBACK) - creates the ABAC policy AND
+#                                     removes legacy security in one run.
+#   - abac_migration_inventory_job / abac_migration_apply_abac_job /
+#     abac_migration_finalize_job (resources/phased_jobs.yml) - the ISOLATED
+#     -PHASE alternative: run as 3 separate steps (Inventory -> Apply ABAC
+#     -> Finalize), with an explicit non-final "both mechanisms active"
+#     resting state in between Apply ABAC and Finalize for review.
+#   - `abac_migration_full_e2e_test_job` - the full scenario-coverage test
+#                                     job used to validate the utility
+#                                     end-to-end against live Unity Catalog.
+#
+# Usage:
+#   databricks bundle validate -t source
+#   databricks bundle deploy   -t source
+#   databricks bundle run      abac_migration_job -t source
+#
+#   databricks bundle validate -t target --profile uc_target
+#   databricks bundle deploy   -t target --profile uc_target
+#   databricks bundle run      abac_migration_inventory_job  -t target --profile uc_target
+#   databricks bundle run      abac_migration_apply_abac_job -t target --profile uc_target
+#   databricks bundle run      abac_migration_finalize_job   -t target --profile uc_target
+#
+# Both `source` and `target` below point at the two workspaces already used
+# throughout development/testing (see ~/.databrickscfg profiles `uc_source`
+# / `uc_target` - two distinct metastores). `target`'s `warehouse_id` and
+# `catalogs_json` are already filled in below (see abac_migration/spike/
+# setup_target_phased_test.py for the fixtures the phased jobs expect there).
+
+bundle:
+  name: abac_migration
+
+include:
+  - resources/*.yml
+
+variables:
+  warehouse_id:
+    description: >-
+      SQL warehouse ID used by the resilient SQL Statement Execution API
+      client for every ABAC/Unity Catalog statement (CREATE POLICY,
+      CREATE GOVERNED TAG, DESCRIBE POLICY, ...). Must resolve to DBR/SQL
+      warehouse version >= 18.1 (governed tags requirement).
+    default: "525de76b2ccdd7d5"
+  audit_catalog:
+    description: Catalog that hosts the audit + inventory Delta tables.
+    default: "ril_raw"
+  audit_schema:
+    description: Schema (inside audit_catalog) that hosts the audit + inventory Delta tables.
+    default: "abac_migration_audit"
+  catalogs_json:
+    description: >-
+      JSON list of catalogs the main job's SELECTED_CATALOGS default scope
+      covers - deliberately explicit rather than ALL_CATALOGS (see
+      resources/jobs.yml). Override per workspace/target.
+    default: '["ril_raw","ril_curated","ril_bulk","ril_migration","ril_sandbox"]'
+
+artifacts:
+  abac_migration:
+    type: whl
+    build: python3 setup.py bdist_wheel --dist-dir dist
+    path: .
+
+targets:
+  source:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-7405618912789045.5.azuredatabricks.net
+
+  target:
+    mode: production
+    workspace:
+      host: https://adb-7405609958717235.15.azuredatabricks.net
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      # Serverless Starter Warehouse on the target workspace (DBR/SQL
+      # channel supports governed tags/ABAC policies - verified live).
+      warehouse_id: "03ac4037e7134a18"
+      # Scoped to just ril_raw (which also exists on this - completely
+      # separate - metastore) so a run only touches the dedicated
+      # ril_raw.abac_migration_phased_test fixtures created by
+      # abac_migration/spike/setup_target_phased_test.py, not every
+      # catalog on the workspace.
+      catalogs_json: '["ril_raw"]'

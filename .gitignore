@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.whl
+
+# Databricks CLI local state (deployment manifests, sync snapshots - no
+# secrets, but purely local/machine-specific and already self-excluded via
+# .databricks/.gitignore)
+.databricks/
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local credentials - never commit, even if one shows up accidentally
+.databrickscfg
+*.pem
+*.key

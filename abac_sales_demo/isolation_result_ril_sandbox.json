@@ -1,0 +1,126 @@
+{
+  "Retail": {
+    "current_user": "retail.test.user@ril-abac-demo.com",
+    "customers_visible_business_units": {
+      "Retail": 10
+    },
+    "orders_visible_business_units": {
+      "Retail": 15
+    },
+    "payments_visible_business_units": {
+      "Retail": 15
+    },
+    "total_customers_visible": 10,
+    "customers_sample": [
+      {
+        "full_name": "Reyansh Iyer",
+        "email": "r***@gmail.com",
+        "phone_number": "******2820",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "Retail"
+      },
+      {
+        "full_name": "Arjun Bhatia",
+        "email": "a***@gmail.com",
+        "phone_number": "******0793",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "Retail"
+      },
+      {
+        "full_name": "Saanvi Chatterjee",
+        "email": "s***@gmail.com",
+        "phone_number": "******9979",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "Retail"
+      }
+    ],
+    "payments_sample": [
+      {
+        "payment_id": 2,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "Retail"
+      },
+      {
+        "payment_id": 4,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "Retail"
+      },
+      {
+        "payment_id": 6,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "Retail"
+      }
+    ]
+  },
+  "O2C": {
+    "current_user": "o2c.test.user@ril-abac-demo.com",
+    "customers_visible_business_units": {
+      "O2C": 10
+    },
+    "orders_visible_business_units": {
+      "O2C": 15
+    },
+    "payments_visible_business_units": {
+      "O2C": 15
+    },
+    "total_customers_visible": 10,
+    "customers_sample": [
+      {
+        "full_name": "Diya Nair",
+        "email": "d***@ril-o2c-partner.com",
+        "phone_number": "******5328",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "O2C"
+      },
+      {
+        "full_name": "Sai Nair",
+        "email": "s***@ril-o2c-partner.com",
+        "phone_number": "******2242",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "O2C"
+      },
+      {
+        "full_name": "Aditya Rao",
+        "email": "a***@ril-o2c-partner.com",
+        "phone_number": "******7576",
+        "pan_number": "REDACTED",
+        "aadhaar_number": "REDACTED",
+        "address": "REDACTED",
+        "business_unit": "O2C"
+      }
+    ],
+    "payments_sample": [
+      {
+        "payment_id": 1,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "O2C"
+      },
+      {
+        "payment_id": 3,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "O2C"
+      },
+      {
+        "payment_id": 5,
+        "card_number": "REDACTED",
+        "card_holder_name": "REDACTED",
+        "business_unit": "O2C"
+      }
+    ]
+  }
+}
