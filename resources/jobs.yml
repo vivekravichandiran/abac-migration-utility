@@ -43,8 +43,6 @@ resources:
         - environment_key: default
           spec:
             client: "3"
-            dependencies:
-              - ../dist/*.whl
 
     abac_migration_full_e2e_test_job:
       name: "ABAC Migration Utility - Full E2E Scenario Test"
@@ -74,5 +72,3 @@ resources:
         - environment_key: default
           spec:
             client: "3"
-            dependencies:
-              - ../dist/*.whl

@@ -1,13 +1,14 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # ABAC Migration Utility - Full End-to-End Scenario Test
-# MAGIC Runs the real `abac_migration` package (installed as a wheel library on
-# MAGIC this job's task, unmodified) against real Unity Catalog tables in this
-# MAGIC workspace: the `sales_abac_demo` fixtures plus dedicated edge-case
-# MAGIC fixtures in `<audit_catalog>.abac_migration_scenario_tests`. Exercises
-# MAGIC dry-run, real migration, idempotent rerun, VERIFY (post-validation),
-# MAGIC drift detection/RECONCILE, and ROLLBACK end to end against live UC, via
-# MAGIC the SQL Statement Execution API.
+# MAGIC Runs the real `abac_migration` package (synced to the workspace as plain
+# MAGIC files by `databricks bundle deploy`, unmodified - no wheel/library
+# MAGIC install) against real Unity Catalog tables in this workspace: the
+# MAGIC `sales_abac_demo` fixtures plus dedicated edge-case fixtures in
+# MAGIC `<audit_catalog>.abac_migration_scenario_tests`. Exercises dry-run, real
+# MAGIC migration, idempotent rerun, VERIFY (post-validation), drift
+# MAGIC detection/RECONCILE, and ROLLBACK end to end against live UC, via the SQL
+# MAGIC Statement Execution API.
 # MAGIC
 # MAGIC This is the bundle-deployable, parameterized version of the ad hoc
 # MAGIC script used to validate the utility (`abac_migration/spike/job_notebook_source.py`);
@@ -15,6 +16,14 @@
 # MAGIC now job parameters/notebook-context-derived instead of hardcoded.
 
 # COMMAND ----------
+import os
+import sys
+
+# See notebooks/abac_migration_run.py for why this is needed: no wheel is
+# built/installed - `abac_migration/` is just a synced sibling directory of
+# this notebook's own folder once deployed.
+sys.path.append(os.path.abspath(".."))
+
 import json
 
 from abac_migration.audit.audit_repository import AuditRepository

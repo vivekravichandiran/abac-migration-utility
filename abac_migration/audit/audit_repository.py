@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..uc_gateway.gateway import UnityCatalogGateway
+from ..uc_gateway.gateway import UCGatewayError, UnityCatalogGateway
 from .sql_literals import sql_literal
 
 INVENTORY_TABLE_DDL = """
@@ -41,6 +41,24 @@ CREATE TABLE IF NOT EXISTS {fqn} (
   column_mask_suggested_pii_tags STRING
 ) USING DELTA
 """.strip()
+
+# Kept in sync with INVENTORY_TABLE_DDL's column list (name, type) so
+# ensure_tables_exist() can backfill columns added after a table was first
+# created (see _add_missing_columns below) - `CREATE TABLE IF NOT EXISTS`
+# alone is a no-op against a pre-existing table with an older/narrower
+# schema, e.g. an `inventory`/`migration_audit` table created before the
+# PII-suggestion or `migration_phase` columns existed.
+_INVENTORY_EXPECTED_COLUMNS = [
+    ("run_id", "STRING"), ("inventoried_at", "TIMESTAMP"), ("catalog", "STRING"),
+    ("schema", "STRING"), ("table", "STRING"), ("full_name", "STRING"), ("table_type", "STRING"),
+    ("has_row_filter", "BOOLEAN"), ("row_filter_function", "STRING"),
+    ("row_filter_columns", "ARRAY<STRING>"), ("row_filter_expression_text", "STRING"),
+    ("has_column_masks", "BOOLEAN"), ("column_masks", "ARRAY<STRUCT<column: STRING, function: STRING>>"),
+    ("has_existing_abac_policy", "BOOLEAN"), ("existing_abac_policy_names", "ARRAY<STRING>"),
+    ("migration_eligibility", "STRING"), ("eligibility_reason", "STRING"),
+    ("current_migration_status", "STRING"),
+    ("row_filter_suggested_pii_tag", "STRING"), ("column_mask_suggested_pii_tags", "STRING"),
+]
 
 MIGRATION_AUDIT_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS {fqn} (
@@ -72,6 +90,49 @@ CREATE TABLE IF NOT EXISTS {fqn} (
   dry_run BOOLEAN
 ) USING DELTA
 """.strip()
+
+# Kept in sync with MIGRATION_AUDIT_TABLE_DDL - see
+# _INVENTORY_EXPECTED_COLUMNS's comment above for why this exists.
+_MIGRATION_AUDIT_EXPECTED_COLUMNS = [
+    ("run_id", "STRING"), ("attempt_id", "STRING"), ("catalog", "STRING"), ("schema", "STRING"),
+    ("table", "STRING"), ("object_type", "STRING"), ("masked_column", "STRING"),
+    ("source_security_type", "STRING"), ("source_function", "STRING"), ("source_definition", "STRING"),
+    ("target_policy_name", "STRING"), ("target_policy_type", "STRING"), ("target_definition", "STRING"),
+    ("status", "STRING"), ("error_code", "STRING"), ("error_message", "STRING"),
+    ("validation_status", "STRING"), ("rollback_metadata", "STRING"), ("migration_phase", "STRING"),
+    ("started_at", "TIMESTAMP"), ("completed_at", "TIMESTAMP"), ("dry_run", "BOOLEAN"),
+]
+
+
+def _existing_columns(uc: UnityCatalogGateway, fqn: str) -> Optional[set]:
+    """None means "table doesn't exist yet" (fresh deploy, or its own
+    `CREATE TABLE IF NOT EXISTS` was itself skipped under dry_run) - treated
+    as "nothing to backfill" by the caller, not an error."""
+    try:
+        rows = uc.run_sql(f"DESCRIBE TABLE {fqn}")
+    except UCGatewayError:
+        return None
+    return {row[0].lower() for row in rows if row and row[0] and not str(row[0]).startswith("#")}
+
+
+def _add_missing_columns(uc: UnityCatalogGateway, fqn: str, expected_columns: list, dry_run: bool) -> None:
+    """Backfills columns added to the schema after a table was first created
+    (e.g. `migration_phase`, the two PII-suggestion columns) via `ALTER
+    TABLE ... ADD COLUMNS`. Databricks SQL has no `ADD COLUMN IF NOT
+    EXISTS` (confirmed live: PARSE_SYNTAX_ERROR), so the diff against
+    `DESCRIBE TABLE` is done here in Python instead. Skipped entirely under
+    dry_run, same as every other persistence/DDL call in this module."""
+    if dry_run:
+        return
+    existing = _existing_columns(uc, fqn)
+    if existing is None:
+        return
+    missing = [(name, col_type) for name, col_type in expected_columns if name.lower() not in existing]
+    if not missing:
+        return
+    cols_sql = ", ".join(f"{name} {col_type}" for name, col_type in missing)
+    uc.run_sql(f"ALTER TABLE {fqn} ADD COLUMNS ({cols_sql})", dry_run=dry_run)
+
 
 # `migration_audit` is append-only (one row-set per object per run - see
 # module docstring), so "current state" always means "latest row per
@@ -157,6 +218,15 @@ class AuditRepository:
         self._uc.run_sql(f"CREATE SCHEMA IF NOT EXISTS {self._audit_full_schema}", dry_run=dry_run)
         self._uc.run_sql(INVENTORY_TABLE_DDL.format(fqn=self._inventory_table_fqn), dry_run=dry_run)
         self._uc.run_sql(MIGRATION_AUDIT_TABLE_DDL.format(fqn=self._audit_table_fqn), dry_run=dry_run)
+        # `CREATE TABLE IF NOT EXISTS` above is a no-op against tables that
+        # already existed with an older/narrower schema (e.g. this exact
+        # audit_catalog/audit_schema reused across many earlier test runs,
+        # predating `migration_phase` or the PII-suggestion columns) - back-
+        # fill any columns the current schema expects but the live table is
+        # missing, so the CREATE OR REPLACE VIEW below never hits
+        # UNRESOLVED_COLUMN.
+        _add_missing_columns(self._uc, self._inventory_table_fqn, _INVENTORY_EXPECTED_COLUMNS, dry_run)
+        _add_missing_columns(self._uc, self._audit_table_fqn, _MIGRATION_AUDIT_EXPECTED_COLUMNS, dry_run)
         # CREATE OR REPLACE so the view's definition self-heals if this
         # module's DDL changes later - re-running is always safe/idempotent.
         # Skipped under dry_run like everything else here (§ dry_run gates

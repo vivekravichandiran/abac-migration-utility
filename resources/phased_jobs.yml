@@ -36,8 +36,6 @@ resources:
         - environment_key: default
           spec:
             client: "3"
-            dependencies:
-              - ../dist/*.whl
 
     abac_migration_apply_abac_job:
       name: "ABAC Migration - 2. Apply ABAC"
@@ -75,8 +73,6 @@ resources:
         - environment_key: default
           spec:
             client: "3"
-            dependencies:
-              - ../dist/*.whl
 
     abac_migration_finalize_job:
       name: "ABAC Migration - 3. Finalize"
@@ -111,5 +107,3 @@ resources:
         - environment_key: default
           spec:
             client: "3"
-            dependencies:
-              - ../dist/*.whl

@@ -3,10 +3,22 @@
 Converts legacy Unity Catalog row filters and column masks into
 attribute-based (ABAC) `ROW_FILTER` / `COLUMN_MASK` policies, backed by
 governed tags. Deployed as a Databricks Asset Bundle (`databricks.yml`) that
-packages the `abac_migration` Python package as a wheel and runs it via
-Databricks Jobs (serverless compute). See `abac_migration/DESIGN.md` for the
-full architecture/design spec — this file is a practical, task-oriented
-guide focused on **how to run the tool and what each mode does**.
+syncs the `abac_migration` Python package to the workspace as plain files
+(no wheel build/install step - see the "Deployment model" note below) and
+runs it via Databricks Jobs (serverless compute). See
+`abac_migration/DESIGN.md` for the full architecture/design spec — this
+file is a practical, task-oriented guide focused on **how to run the tool
+and what each mode does**.
+
+**Deployment model.** `databricks bundle deploy` syncs this repo straight to
+the workspace (respecting `.gitignore` + `databricks.yml`'s `sync.exclude`)
+- there's no `python setup.py bdist_wheel`, no wheel file, and no library
+install step anywhere in the pipeline. Each job's driver notebook
+(`notebooks/abac_migration_run.py`, `notebooks/abac_migration_full_e2e_test.py`)
+adds the synced `abac_migration/` directory to `sys.path` before importing
+it. This means `databricks bundle deploy` never needs a Python toolchain on
+the machine/CI runner running it - any CI system just needs the Databricks
+CLI installed plus `DATABRICKS_HOST`/`DATABRICKS_TOKEN` (or OIDC).
 
 ## Quick start
 

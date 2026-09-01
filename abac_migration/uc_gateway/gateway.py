@@ -86,10 +86,21 @@ def is_permission_denied(exc: "UCGatewayError") -> bool:
 # *different* message ("Unknown tag policy key ...") rather than the
 # existing-key/new-value message. Both are the same underlying
 # semantic-but-transient condition, distinct from HTTP-level throttling
-# (§10.1), so both get the same bounded retry loop; the wait window is sized
-# for the slower brand-new-key case.
+# (§10.1), so both get the same bounded retry loop.
+#
+# Confirmed live again (2026-09-01, `ril_abac_e2e_test` 12-table batch on
+# the SOURCE workspace) that this can exceed the original 150s budget when
+# an APPLY_ABAC run mints many brand-new tag *keys* back-to-back (here:
+# ~20 new keys across 12 tables in one "Prepare Governed Tags" phase right
+# before the parallel CREATE POLICY phase) - every one of the 12 tables
+# failed with this exact "Invalid tag value ..." message, and manually
+# re-running the identical `CREATE OR REPLACE POLICY` statement ~25 minutes
+# later (well past the retry budget) succeeded immediately, confirming it
+# was still just propagation lag, not a real error. Bumped the ceiling
+# accordingly - still bounded/fails loudly past the ceiling, just sized for
+# a bulk-provisioning run instead of the original single/few-table spike.
 TAG_PROPAGATION_ERROR_SUBSTRINGS = ("Invalid tag value", "Unknown tag policy key")
-TAG_PROPAGATION_MAX_WAIT_S = 150.0
+TAG_PROPAGATION_MAX_WAIT_S = 420.0
 TAG_PROPAGATION_POLL_INTERVAL_S = 10.0
 
 
@@ -498,7 +509,24 @@ class DatabricksUnityCatalogGateway:
             f"SELECT column_name, tag_name, tag_value FROM {quote_ident(table.catalog)}.information_schema.column_tags "
             f"WHERE schema_name = '{table.schema}' AND table_name = '{table.table}'"
         )
-        return [ColumnTagAssignment(column=row[0], tag_key=row[1], tag_value=row[2]) for row in res.rows]
+        # A key-only tag (`SET TAGS ('key')`, no `= value`) is persisted by
+        # Databricks as tag_value = '' (empty string), NOT NULL - confirmed
+        # live via this exact query. Normalized to None here (the single
+        # place raw column_tags rows enter the system) so every downstream
+        # consumer - critically tag_provisioner._find_reusable_tag(), which
+        # feeds this straight into MatchColumn.tag_value - sees the same
+        # None-means-key-only convention _mint_and_assign() itself uses.
+        # Without this, has_tag(key) (correct, used when a tag is first
+        # minted) silently turns into has_tag_value(key, '') on every
+        # SUBSEQUENT run that reuses the tag (prefer_existing_tags), which
+        # UC's policy compiler deterministically rejects with "Invalid tag
+        # value `` for key ..." - confirmed live (2026-09-01): NOT a
+        # propagation-lag transient (retrying for the full bounded window
+        # never helps), a 100%-reproducible bug on every idempotent rerun.
+        return [
+            ColumnTagAssignment(column=row[0], tag_key=row[1], tag_value=(row[2] if row[2] else None))
+            for row in res.rows
+        ]
 
     def set_column_tags(self, table: TableRef, column: str, tags: dict, dry_run: bool) -> None:
         # A None value means a key-only/presence tag (confirmed live: `SET

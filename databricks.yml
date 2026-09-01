@@ -1,10 +1,19 @@
 # Databricks Asset Bundle for the ABAC Migration Utility.
 #
 # Deploys:
-#   - The `abac_migration` Python package, built as a wheel (see setup.py)
-#     and attached as a job library - this replaces the manual
-#     "upload package to workspace files" step used during development
-#     (abac_migration/spike/upload_package_to_workspace.py).
+#   - The `abac_migration` Python package as plain workspace files (NOT a
+#     wheel - no `python setup.py bdist_wheel`, no build step of any kind).
+#     `databricks bundle deploy` syncs the whole bundle tree (respecting
+#     `.gitignore` + the `sync.exclude` list below) straight to the
+#     workspace under each target's `root_path`. Since none of
+#     `abac_migration/**/*.py` carry the `# Databricks notebook source`
+#     header, they land as ordinary importable Python files, not notebooks
+#     - every job's driver notebook adds that synced directory to
+#     `sys.path` before `import abac_migration...` (see
+#     `notebooks/abac_migration_run.py` / `notebooks/abac_migration_full_e2e_test.py`).
+#     This is the same idea as the manual pre-bundle spike
+#     (`abac_migration/spike/upload_package_to_workspace.py`), just done
+#     automatically by `bundle deploy` instead of a one-off script.
 #   - `abac_migration_job`          - the production-facing, parameterized
 #                                     ATOMIC migration job (INVENTORY/MIGRATE/
 #                                     INVENTORY_AND_MIGRATE/VERIFY/RECONCILE/
@@ -30,6 +39,13 @@
 #   databricks bundle run      abac_migration_apply_abac_job -t target --profile uc_target
 #   databricks bundle run      abac_migration_finalize_job   -t target --profile uc_target
 #
+# CI: `databricks bundle deploy` never shells out to Python at all - file
+# sync is a pure Databricks CLI/API operation (Workspace Import API), same
+# as `git push`. Any CI runner that can install the Databricks CLI and set
+# DATABRICKS_HOST/DATABRICKS_TOKEN can run `databricks bundle deploy`
+# directly - no Python toolchain, build step, or pipeline scaffolding
+# required.
+#
 # Both `source` and `target` below point at the two workspaces already used
 # throughout development/testing (see ~/.databrickscfg profiles `uc_source`
 # / `uc_target` - two distinct metastores). `target`'s `warehouse_id` and
@@ -41,6 +57,18 @@ bundle:
 
 include:
   - resources/*.yml
+
+# Dev-only content that should never be pushed to the workspace as part of
+# every deploy: tests, one-off spike/setup scripts, the source PDF design
+# doc, and anything already covered by .gitignore (__pycache__, dist/,
+# build/, egg-info, .databricks/, etc. - bundle sync respects .gitignore
+# automatically, this list is the extra stuff that isn't gitignored).
+sync:
+  exclude:
+    - "abac_migration/tests/**"
+    - "abac_migration/spike/**"
+    - "abac_sales_demo/**"
+    - "*.md"
 
 variables:
   warehouse_id:
@@ -62,12 +90,6 @@ variables:
       covers - deliberately explicit rather than ALL_CATALOGS (see
       resources/jobs.yml). Override per workspace/target.
     default: '["ril_raw","ril_curated","ril_bulk","ril_migration","ril_sandbox"]'
-
-artifacts:
-  abac_migration:
-    type: whl
-    build: python3 setup.py bdist_wheel --dist-dir dist
-    path: .
 
 targets:
   source:

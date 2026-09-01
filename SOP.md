@@ -112,6 +112,29 @@ their reasoning, only the operating steps.
 You only need to redo step 4 when the code changes. Steps 1–3 are one-time
 per workspace.
 
+**Deploying from a CI runner with no Python toolchain.** There is no wheel
+anywhere in this pipeline — no `setup.py`, no `bdist_wheel`, no library
+install. `databricks bundle deploy` just syncs this repo's files straight
+into the workspace (respecting `.gitignore` + `databricks.yml`'s
+`sync.exclude`), the same way `git push` copies files - a pure
+Databricks-CLI/API operation, not a Python one. Each job's driver notebook
+(`notebooks/abac_migration_run.py`, `notebooks/abac_migration_full_e2e_test.py`)
+adds the synced `abac_migration/` directory to `sys.path` before
+`import abac_migration...`, since none of its `.py` files carry the
+`# Databricks notebook source` header (so they sync as plain importable
+files, not notebooks). That means `databricks bundle deploy` never needs
+Python/pip/setuptools on whatever machine or CI runner is running it - any
+CI system (Azure DevOps, GitHub Actions, GitLab CI, Jenkins, ...) just
+needs to install the Databricks CLI and set `DATABRICKS_HOST`/
+`DATABRICKS_TOKEN` (or OIDC), then run:
+
+```bash
+databricks bundle validate -t target
+databricks bundle deploy   -t target
+```
+
+No pipeline-specific scaffolding is required beyond that.
+
 ---
 
 ## 4. Three ways to trigger a run — pick whichever is easiest for you

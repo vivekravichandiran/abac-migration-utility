@@ -12,11 +12,24 @@
 # MAGIC 3. Delegates to `abac_migration.migration.migration_engine.run()` and
 # MAGIC    prints/returns the report.
 # MAGIC
-# MAGIC The `abac_migration` package itself is installed as a wheel library on
-# MAGIC this job's task (see `resources/jobs.yml`), built from the source in
-# MAGIC `abac_migration/` by the bundle's `artifacts` block.
+# MAGIC The `abac_migration` package is NOT a wheel/library dependency - the
+# MAGIC bundle (`databricks.yml`) syncs the whole source tree to the workspace
+# MAGIC as plain files on every `databricks bundle deploy`, and the two lines
+# MAGIC below just add that synced directory to `sys.path` so `import
+# MAGIC abac_migration...` resolves to it directly, no build/install step
+# MAGIC involved.
 
 # COMMAND ----------
+import os
+import sys
+
+# This notebook lives at <root>/notebooks/abac_migration_run.py once synced;
+# `abac_migration/` is a sibling directory one level up. Databricks sets a
+# notebook's default working directory to its own containing folder, so
+# `os.path.abspath("..")` resolves to `<root>` for both interactive runs and
+# job runs.
+sys.path.append(os.path.abspath(".."))
+
 import dataclasses
 import enum
 import json
