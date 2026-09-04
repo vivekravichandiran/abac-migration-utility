@@ -58,6 +58,67 @@ def test_list_column_tags_preserves_a_real_non_empty_value():
     assert tags[0].tag_value == "a1b2c3"
 
 
+# ---------------------------------------------------------------------------
+# show_policies()/describe_policy()/drop_policy() take an already-built
+# `on_securable` string (from PolicyStrategy.on_securable_for(), §7.3) not a
+# bare TableRef - the one signature change that lets these three methods
+# serve both "table level application" (`ON TABLE ...`) and "catalog level
+# application" (`ON CATALOG ...`) without a second set of methods.
+# ---------------------------------------------------------------------------
+
+def test_show_policies_builds_on_clause_verbatim_for_table_scope():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.show_policies("TABLE `cat`.`sch`.`tbl`")
+
+    assert executor.statements == ["SHOW POLICIES ON TABLE `cat`.`sch`.`tbl`"]
+
+
+def test_show_policies_builds_on_clause_verbatim_for_catalog_scope():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.show_policies("CATALOG `cat`")
+
+    assert executor.statements == ["SHOW POLICIES ON CATALOG `cat`"]
+
+
+class _StubExecutorWithErrorCode(_StubExecutor):
+    """_StubExecutor's `_Result` omits `error_code` (fine for the SUCCEEDED-
+    only tests above) - `describe_policy()` always checks it, even on a
+    SUCCEEDED response, so this variant sets it to None explicitly."""
+
+    def run(self, statement, timeout_s=60):
+        self.statements.append(statement)
+
+        class _Result:
+            status = "SUCCEEDED"
+            error = None
+            error_code = None
+            rows = self.rows
+
+        return _Result()
+
+
+def test_describe_policy_builds_on_clause_for_catalog_scope():
+    executor = _StubExecutorWithErrorCode(rows=[["Name", "abac_rls_cat_sch_fn"], ["Policy Type", "ROW_FILTER"]])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.describe_policy("CATALOG `cat`", "abac_rls_cat_sch_fn")
+
+    assert executor.statements == ["DESCRIBE POLICY abac_rls_cat_sch_fn ON CATALOG `cat`"]
+
+
+def test_drop_policy_builds_on_clause_for_catalog_scope():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.drop_policy("CATALOG `cat`", "abac_rls_cat_sch_fn", dry_run=False)
+
+    assert executor.statements == ["DROP POLICY abac_rls_cat_sch_fn ON CATALOG `cat`"]
+
+
 def test_list_column_tags_preserves_a_genuinely_null_value():
     executor = _StubExecutor(rows=[["department", "abac_rls_cat_sch_rf_dept", None]])
     gateway = DatabricksUnityCatalogGateway(executor)

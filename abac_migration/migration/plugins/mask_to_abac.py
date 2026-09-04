@@ -1,7 +1,13 @@
 """ColumnMaskMigrationPlugin: discover/validate/convert/verify/rollback for
-table-level Column Masks -> ABAC COLUMN_MASK policies, one masked column at
-a time (§2, §5). Each column is an independent unit - one column's failure
-never blocks the others in the same table (§10).
+Column Masks -> ABAC COLUMN_MASK policies, one masked column at a time
+(§2, §5). Each column is an independent unit - one column's failure never
+blocks the others in the same table (§10). Deliberately scope-agnostic:
+every `ON <securable>` clause and every deterministic policy name comes
+from `self._policy_strategy` (policy_strategy.py) - this plugin works
+identically whether the strategy is table-scoped ("table level
+application", one policy per masked COLUMN) or catalog-scoped ("catalog
+level application", one policy per masking FUNCTION, shared by every
+column/table it happens to mask).
 """
 from __future__ import annotations
 
@@ -18,25 +24,19 @@ class ColumnMaskMigrationPlugin:
     def __init__(self, policy_strategy: PolicyStrategy):
         self._policy_strategy = policy_strategy
 
-    _MASK_POLICY_PREFIX = "abac_migrated_mask_"
-
     def applies_to(self, table: TableRef, uc: UnityCatalogGateway) -> bool:
         if uc.describe_table_security(table).has_column_masks:
             return True
         # Legacy masks may already have been removed by a prior successful
         # run (§7 idempotency) - still "applicable" so a rerun correctly
         # reports ALREADY_MIGRATED instead of NO_LEGACY_SECURITY_FOUND.
-        return any(
-            p.policy_type == "COLUMN_MASK" and p.policy_name.startswith(self._MASK_POLICY_PREFIX)
-            for p in uc.show_policies(table)
-        )
+        return len(self._policy_strategy.find_existing_mask_policies(table, uc)) > 0
 
     def discover(self, table: TableRef, uc: UnityCatalogGateway) -> DiscoveryResult:
         state = uc.describe_table_security(table)
-        policies = uc.show_policies(table)
-        already_migrated_exists = any(
-            p.policy_type == "COLUMN_MASK" and p.policy_name.startswith(self._MASK_POLICY_PREFIX) for p in policies
-        )
+        on_securable = self._policy_strategy.on_securable_for(table)
+        policies = uc.show_policies(on_securable)
+        already_migrated_exists = len(self._policy_strategy.find_existing_mask_policies(table, uc)) > 0
         applicable = state.has_column_masks or already_migrated_exists
         return DiscoveryResult(applicable=applicable, security_state=state, existing_policies=policies)
 
@@ -52,29 +52,21 @@ class ColumnMaskMigrationPlugin:
 
         planned = [self._validate_one_mask(table, mask, discovery, uc) for mask in legacy_masks]
 
-        # Columns whose legacy mask is already gone but a matching-named
+        # Columns whose legacy mask is already gone but a matching-function
         # ABAC policy still exists (§7): legacy discovery can no longer see
-        # these directly, so reconstruct them from policy names.
-        already_migrated_columns = {
-            p.policy_name[len(self._MASK_POLICY_PREFIX):]
-            for p in discovery.existing_policies
-            if p.policy_type == "COLUMN_MASK" and p.policy_name.startswith(self._MASK_POLICY_PREFIX)
-            and p.policy_name[len(self._MASK_POLICY_PREFIX):] not in legacy_columns
-        }
-        for column in sorted(already_migrated_columns):
-            policy_name = self._policy_strategy.mask_policy_name(column)
-            policy_def = uc.describe_policy(table, policy_name)
+        # these directly, so recover them via the strategy instead.
+        for existing in self._policy_strategy.find_existing_mask_policies(table, uc):
+            if existing.column in legacy_columns:
+                continue
             planned.append(PlannedObject(
-                masked_column=column, source_function=policy_def.function_fqn if policy_def else "",
+                masked_column=existing.column, source_function=existing.policy_def.function_fqn,
                 source_using_columns=[], tag_requests=[], decision="ALREADY_MIGRATED",
-                existing_policy_name=policy_name,
+                existing_policy_name=existing.policy_def.name,
             ))
 
         return ValidationResult(planned_objects=planned)
 
     def _validate_one_mask(self, table, mask, discovery, uc) -> PlannedObject:
-        deterministic_name = self._policy_strategy.mask_policy_name(mask.column)
-
         if not uc.function_exists(mask.function_fqn):
             return PlannedObject(
                 masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
@@ -85,6 +77,9 @@ class ColumnMaskMigrationPlugin:
                 masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_ACCESSIBLE",
             )
+
+        deterministic_name = self._policy_strategy.mask_policy_name(mask.column, mask.function_fqn)
+        on_securable = self._policy_strategy.on_securable_for(table)
 
         # NOTE: `mask` only ever gets here via `legacy_masks` (§ discover), i.e.
         # the LEGACY mask is still live right now. So even if a matching ABAC
@@ -99,10 +94,14 @@ class ColumnMaskMigrationPlugin:
         # migrated column (both mechanisms simultaneously active) could never
         # self-heal on rerun. Always PROCEED so the (idempotent) CREATE OR
         # REPLACE POLICY + legacy-removal retry actually runs again.
+        #
+        # Membership in `discovery.existing_policies` (SHOW POLICIES) is
+        # checked BEFORE the more expensive/authoritative DESCRIBE POLICY
+        # call - see the identical comment in rls_to_abac.py's validate().
         existing_ref = next((p for p in discovery.existing_policies if p.policy_name == deterministic_name), None)
         abac_already_applied = False
         if existing_ref is not None:
-            existing_def = uc.describe_policy(table, deterministic_name)
+            existing_def = uc.describe_policy(on_securable, deterministic_name)
             if existing_def is not None and existing_def.function_fqn != mask.function_fqn:
                 return PlannedObject(
                     masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
@@ -186,7 +185,7 @@ class ColumnMaskMigrationPlugin:
                 error_code=apply_result.error_code or "POLICY_CREATE_FAILED", error_message=apply_result.error_message,
             )
 
-        verify_def = uc.describe_policy(table, spec.policy_name)
+        verify_def = uc.describe_policy(spec.on_securable, spec.policy_name)
         if verify_def is None or verify_def.function_fqn != spec.function_fqn:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
@@ -208,7 +207,6 @@ class ColumnMaskMigrationPlugin:
         ABAC policy was already applied, then do the final state
         verification. Never creates a policy - refuses (NOT_ELIGIBLE) if
         APPLY_ABAC hasn't run for this column yet."""
-        deterministic_name = self._policy_strategy.mask_policy_name(obj.masked_column)
         if not obj.abac_already_applied:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.NOT_ELIGIBLE, masked_column=obj.masked_column,
@@ -217,7 +215,9 @@ class ColumnMaskMigrationPlugin:
                                "run Mode.APPLY_ABAC (or MIGRATE) first.",
             )
 
-        verify_def = uc.describe_policy(table, deterministic_name)
+        deterministic_name = self._policy_strategy.mask_policy_name(obj.masked_column, obj.source_function)
+        on_securable = self._policy_strategy.on_securable_for(table)
+        verify_def = uc.describe_policy(on_securable, deterministic_name)
         if verify_def is None or verify_def.function_fqn != obj.source_function:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
@@ -228,8 +228,7 @@ class ColumnMaskMigrationPlugin:
         rollback_metadata = {
             "original_column_masks": [{"column": obj.masked_column, "function": obj.source_function}],
             "abac_policies_created_by_this_run": [
-                {"policy_name": deterministic_name, "on_securable": f"TABLE {table.quoted_full_name}",
-                 "policy_type": "COLUMN_MASK"},
+                {"policy_name": deterministic_name, "on_securable": on_securable, "policy_type": "COLUMN_MASK"},
             ],
         }
 
@@ -298,7 +297,7 @@ class ColumnMaskMigrationPlugin:
                 error_code=apply_result.error_code or "POLICY_CREATE_FAILED", error_message=apply_result.error_message,
             )
 
-        verify_def = uc.describe_policy(table, spec.policy_name)
+        verify_def = uc.describe_policy(spec.on_securable, spec.policy_name)
         if verify_def is None or verify_def.function_fqn != spec.function_fqn:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
@@ -309,7 +308,7 @@ class ColumnMaskMigrationPlugin:
 
         try:
             uc.drop_column_mask(table, obj.masked_column, dry_run=False)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - converted into a taxonomy'd failure, never bubbled raw
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
                 source_function=obj.source_function, target_policy_name=spec.policy_name,
@@ -333,31 +332,30 @@ class ColumnMaskMigrationPlugin:
         )
 
     def verify(self, table: TableRef, uc: UnityCatalogGateway) -> list:
+        """Mirrors the pre-existing TABLE_BASED semantics exactly (iterate
+        already-*discoverable* ABAC mask policies via the strategy, not raw
+        legacy state) - a masked column that was never migrated at all (no
+        ABAC policy exists yet for it) reports nothing here, same as before
+        this method delegated naming/discovery to PolicyStrategy. Consistent
+        across scopes since `find_existing_mask_policies` already
+        encapsulates exactly "what does this table have today" for either
+        scope."""
         state = uc.describe_table_security(table)
+        still_legacy_columns = {m.column for m in state.column_masks}
         results = []
-        for policy_ref in uc.show_policies(table):
-            if policy_ref.policy_type != "COLUMN_MASK" or not policy_ref.policy_name.startswith("abac_migrated_mask_"):
-                continue
-            column = policy_ref.policy_name[len("abac_migrated_mask_"):]
-            policy_def = uc.describe_policy(table, policy_ref.policy_name)
-            still_legacy_masked = any(m.column == column for m in state.column_masks)
-            if policy_def is not None and not still_legacy_masked:
-                results.append(ConversionStepResult(
-                    object_type=self.object_type, status=StepStatus.SUCCESS, masked_column=column,
-                    source_function=policy_def.function_fqn, target_policy_name=policy_ref.policy_name,
-                ))
-            elif policy_def is not None and still_legacy_masked:
+        for existing in self._policy_strategy.find_existing_mask_policies(table, uc):
+            if existing.column in still_legacy_columns:
                 # Both mechanisms present - expected, non-final resting state
                 # after an APPLY_ABAC-phase run awaiting FINALIZE. Not a
                 # failure - see the identical case in rls_to_abac.py.
                 results.append(ConversionStepResult(
-                    object_type=self.object_type, status=StepStatus.ABAC_APPLIED, masked_column=column,
-                    source_function=policy_def.function_fqn, target_policy_name=policy_ref.policy_name,
+                    object_type=self.object_type, status=StepStatus.ABAC_APPLIED, masked_column=existing.column,
+                    source_function=existing.policy_def.function_fqn, target_policy_name=existing.policy_def.name,
                 ))
             else:
                 results.append(ConversionStepResult(
-                    object_type=self.object_type, status=StepStatus.FAILED, masked_column=column,
-                    target_policy_name=policy_ref.policy_name, error_code="POLICY_VERIFY_FAILED",
+                    object_type=self.object_type, status=StepStatus.SUCCESS, masked_column=existing.column,
+                    source_function=existing.policy_def.function_fqn, target_policy_name=existing.policy_def.name,
                 ))
         return results
 
@@ -368,9 +366,13 @@ class ColumnMaskMigrationPlugin:
             for policy_info in rollback_metadata.get("abac_policies_created_by_this_run", []):
                 if policy_info.get("policy_type") != "COLUMN_MASK":
                     continue
-                if policy_info["policy_name"] != self._policy_strategy.mask_policy_name(column):
+                if policy_info["policy_name"] != self._policy_strategy.mask_policy_name(column, original["function"]):
                     continue
-                uc.drop_policy(table, policy_info["policy_name"], dry_run=dry_run)
+                # See rls_to_abac.py's identical comment: use the exact
+                # on_securable this run created the policy on, not a
+                # recomputation from the current strategy config.
+                on_securable = policy_info.get("on_securable") or self._policy_strategy.on_securable_for(table)
+                uc.drop_policy(on_securable, policy_info["policy_name"], dry_run=dry_run)
 
             if not uc.function_exists(original["function"]):
                 results.append(ConversionStepResult(

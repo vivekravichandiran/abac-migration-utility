@@ -11,6 +11,8 @@ job to report (already covered by test_table_converter.py scenarios 5/6).
 from __future__ import annotations
 
 from ..inventory.inventory_manager import build_inventory_record
+from ..migration.policy_strategy import CatalogBasedPolicyStrategy
+from ..migration.tag_provisioner import tag_key_for_function
 from ..uc_gateway.gateway import UCGatewayError
 from ..uc_gateway.models import PolicyDefinition, TableRef
 from .fake_gateway import FakeUnityCatalogGateway
@@ -229,6 +231,56 @@ def test_real_gateway_suggest_pii_tag_normalizes_llm_response():
     suggestion = gateway.suggest_pii_tag("cat.schema.mask_email_fn", ["email"], "some-endpoint")
 
     assert suggestion.tag == "email"
+
+
+# ---------------------------------------------------------------------------
+# policy_scope=CATALOG ("catalog level application", §7.3) - existing-ABAC-
+# policy detection must be precise per-table even though the policy itself
+# is never directly "on" any one table (see CatalogBasedPolicyStrategy).
+# ---------------------------------------------------------------------------
+
+def test_catalog_scope_already_migrated_table_recovered_via_governed_tag():
+    """Mirrors test_already_migrated_table_with_no_legacy_left_is_still_eligible
+    above, but for CATALOG scope: no legacy left, and no policy directly
+    "on" this table either - only the governed column tag proves it."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "fully_migrated")
+    uc.register_table(table)
+    tag_key = tag_key_for_function("cat.schema.rf_region", "row_filter")
+    uc.add_column_tag(table, "region", tag_key, None)
+    uc.add_existing_catalog_policy("cat", PolicyDefinition(
+        name=tag_key, policy_type="ROW_FILTER", on_securable_type="CATALOG", on_securable="cat",
+        to_principals=["account users"], match_columns=["mc_region"],
+        function_fqn="cat.schema.rf_region", using_columns=["region"],
+    ))
+
+    record = build_inventory_record(table, uc, run_id="run-1", policy_strategy=CatalogBasedPolicyStrategy())
+
+    assert record.migration_eligibility == "ELIGIBLE"
+    assert record.has_existing_abac_policy is True
+    assert record.existing_abac_policy_names == [tag_key]
+
+
+def test_catalog_scope_never_migrated_table_is_not_eligible():
+    """A table with NO legacy security and NO governed tag must not be
+    falsely marked ELIGIBLE just because some OTHER function already has a
+    CATALOG-scoped policy live in the same catalog - the whole point of
+    tag-driven (not `SHOW POLICIES ON CATALOG`-driven) detection."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "untouched")
+    uc.register_table(table)
+    # An unrelated function already migrated elsewhere in this catalog.
+    uc.add_existing_catalog_policy("cat", PolicyDefinition(
+        name=tag_key_for_function("cat.schema.rf_other", "row_filter"), policy_type="ROW_FILTER",
+        on_securable_type="CATALOG", on_securable="cat", to_principals=["account users"],
+        match_columns=["mc_x"], function_fqn="cat.schema.rf_other", using_columns=["x"],
+    ))
+
+    record = build_inventory_record(table, uc, run_id="run-1", policy_strategy=CatalogBasedPolicyStrategy())
+
+    assert record.migration_eligibility == "NOT_ELIGIBLE"
+    assert record.eligibility_reason == "NO_LEGACY_SECURITY_FOUND"
+    assert record.has_existing_abac_policy is False
 
 
 def test_llm_pii_tagging_no_legacy_security_makes_no_calls():

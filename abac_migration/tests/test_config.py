@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ..config.config_loader import load_from_dict
-from ..config.models import ConfigError, Mode, RunConfig, ScopeType
+from ..config.models import ConfigError, Mode, PolicyScope, RunConfig, ScopeType
 
 
 def test_from_dict_parses_json_encoded_widget_strings():
@@ -63,3 +63,24 @@ def test_llm_pii_tagging_defaults_off_and_can_be_enabled_via_widgets():
     })
     assert enabled.enable_llm_pii_tagging is True
     assert enabled.pii_llm_endpoint == "some-other-endpoint"
+
+
+def test_policy_scope_defaults_to_table():
+    config = RunConfig(scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s")
+    assert config.policy_scope == PolicyScope.TABLE
+
+
+def test_policy_scope_parses_catalog_from_widget_string():
+    config = load_from_dict({
+        "mode": "APPLY_ABAC", "scope_type": "ALL_CATALOGS", "audit_catalog": "audit_cat",
+        "audit_schema": "audit_sch", "policy_scope": "CATALOG",
+    })
+    assert config.policy_scope == PolicyScope.CATALOG
+
+
+def test_policy_scope_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        load_from_dict({
+            "mode": "INVENTORY", "scope_type": "ALL_CATALOGS", "audit_catalog": "audit_cat",
+            "audit_schema": "audit_sch", "policy_scope": "SCHEMA_BASED_TYPO",
+        })

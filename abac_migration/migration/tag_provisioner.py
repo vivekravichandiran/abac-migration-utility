@@ -91,7 +91,7 @@ class TagRequest:
     column: str
     role: Literal["row_filter", "mask"]
     # The legacy function this column's security was enforced by - drives
-    # the per-function tag KEY (see _tag_key_for_function). Two TagRequests
+    # the per-function tag KEY (see tag_key_for_function). Two TagRequests
     # for the same function+role always resolve to the same tag key, even
     # across different tables/columns, since one function can guard several
     # tables (§7.3 FunctionBasedPolicyStrategy is deferred, but the tag layer
@@ -131,7 +131,7 @@ def _short_function_name(function_fqn: str) -> str:
     """Just the function's own (unqualified) name - strips catalog/schema
     qualification and backtick-quoting. Used for the human-readable
     description only now (see SYNTHETIC_TAG_DESCRIPTION_TEMPLATE) - the tag
-    KEY itself uses the fully-qualified form via _tag_key_for_function."""
+    KEY itself uses the fully-qualified form via tag_key_for_function."""
     return _fqn_parts(function_fqn)[-1]
 
 
@@ -139,14 +139,22 @@ def _sanitize(part: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", part)
 
 
-def _tag_key_for_function(function_fqn: str, role: Literal["row_filter", "mask"]) -> str:
+def tag_key_for_function(function_fqn: str, role: Literal["row_filter", "mask"]) -> str:
     """One governed tag KEY per (catalog, schema, function, role):
     `abac_<rls|colmask>_<catalog>_<schema>_<function_name>`, each component
     independently sanitized (non `[A-Za-z0-9_]` characters, including
     hyphens, replaced with `_`) - e.g. `jh-demo.some_schema.rf_region_both`
     -> `abac_rls_jh_demo_some_schema_rf_region_both`. Deterministic and
     stable across runs/tables for the same function_fqn; no hash/digest is
-    ever appended (see module docstring)."""
+    ever appended (see module docstring).
+
+    Public (no leading underscore): also reused verbatim by
+    `CatalogBasedPolicyStrategy` (policy_strategy.py) as the CATALOG-scoped
+    policy name for that same function - `CREATE POLICY` and `CREATE
+    GOVERNED TAG` are distinct object kinds with separate namespaces, so
+    reusing the identical deterministic string for both gives free 1:1
+    traceability (one migrated function <-> one name, everywhere) instead
+    of inventing a second parallel naming scheme."""
     role_abbrev = "rls" if role == "row_filter" else "colmask"
     catalog, schema, func_name = _fqn_parts(function_fqn)
     sanitized = "_".join(_sanitize(part) for part in (catalog, schema, func_name) if part)
@@ -235,7 +243,7 @@ class TagProvisioner:
         by_key: dict = {}
         key_owner_fqn: dict = {}
         for req in to_mint:
-            tag_key = _tag_key_for_function(req.function_fqn, req.role)
+            tag_key = tag_key_for_function(req.function_fqn, req.role)
             owner_fqn = key_owner_fqn.setdefault(tag_key, req.function_fqn)
             if owner_fqn != req.function_fqn:
                 raise TagKeyCollisionError(

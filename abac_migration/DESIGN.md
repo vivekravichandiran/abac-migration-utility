@@ -501,7 +501,7 @@ a step between `validate()` and `convert()`'s `CREATE POLICY` call:
    give each legacy function its own governed tag key so
    `SHOW GOVERNED TAGS`/`DESCRIBE GOVERNED TAG` maps 1:1 back to the
    specific function that used to enforce that security). If no suitable
-   existing tag is found, `_tag_key_for_function(function_fqn, role)`
+   existing tag is found, `tag_key_for_function(function_fqn, role)`
    (`migration/tag_provisioner.py`) derives the key deterministically from
    the function's sanitized, fully-qualified `catalog.schema.function_name`,
    prefixed with `abac_rls_`/`abac_colmask_` (e.g.
@@ -582,16 +582,69 @@ a step between `validate()` and `convert()`'s `CREATE POLICY` call:
    but is a deliberate, separate, human-invoked operation — never part of
    automatic per-table rollback.
 
-### Alternative (future, off by default): `FunctionBasedPolicyStrategy`
+### 7.3.1 `PolicyScope`: Table Level vs. Catalog Level Application (both implemented)
 
-Consolidates N tables that share the exact same function + column-name
-pattern into a single `ON SCHEMA`/`ON CATALOG` policy using
-`MATCH COLUMNS has_tag(...) AS alias`. This is the "proper" ABAC end-state
-(one policy, many tables) but **requires those tables/columns to already
-carry consistent governed tags**, which cannot be assumed for a first
-migration of ad hoc legacy RLS/masks. Documented as a deliberate v2
-extension point (`policy_strategy` config parameter already supports
-selecting it later without changing plugin code) rather than the default.
+Steps 1-3 (identify legacy RLS/column masks, mint one governed tag per
+legacy function, apply that tag to the relevant column(s)) are **identical
+regardless of scope** — `tag_provisioner.py` and the discovery/tagging
+phases have no scope awareness at all. Everything scope-specific is
+isolated behind the `PolicyStrategy` Protocol (`migration/policy_strategy.py`),
+injected once into both plugins (`rls_to_abac.py`/`mask_to_abac.py`) and
+`inventory_manager.py` at run start via `migration_engine.build_policy_strategy(config)`.
+Selected per run by the `policy_scope` job/config parameter (§11) — never
+mixed within one run:
+
+**A. `TABLE` — "Table level application" (`TableBasedPolicyStrategy`, default, no behavior change from §7.3 above)**
+
+1. Identify legacy row filter / column masks on the table.
+2. Create one governed tag per legacy function (`tag_provisioner.py`, §7.4).
+3. Apply that tag to the relevant column(s) on the table.
+4. Create the ABAC policy scoped `ON TABLE` — one `ROW_FILTER` policy per
+   table (`abac_migrated_row_filter`) and one `COLUMN_MASK` policy per
+   masked column (`abac_migrated_mask_<column>`), per §7.3.
+5. Manual review (`APPLY_ABAC` leaves both mechanisms live —
+   `migration_audit.migration_phase=ABAC_APPLIED`, explicitly not final —
+   so an operator can confirm the new `ON TABLE` policy produces identical
+   results before anything legacy is touched).
+6. Remove the table-level legacy row filter/column masks (`FINALIZE`).
+
+**B. `CATALOG` — "Catalog level application" (`CatalogBasedPolicyStrategy`)**
+
+Steps 1-3 identical to A. Then:
+
+4. Create the ABAC policy scoped `ON CATALOG` (the catalog the legacy
+   function itself lives in) instead of `ON TABLE` — one policy **per
+   legacy function**, named after `tag_key_for_function(function_fqn, role)`
+   (the same deterministic key used for the governed tag, so
+   `SHOW POLICIES`/`SHOW GOVERNED TAGS` line up 1:1), using
+   `MATCH COLUMNS has_tag(key)`/`has_tag_value(key, value)` exactly as in
+   A. Because the policy lives once `ON CATALOG`, every table across that
+   catalog whose column carries the matching tag is covered by the *same*
+   single policy object — this is the "proper" ABAC end-state (one policy,
+   many tables) called out as a future extension in earlier drafts of this
+   document, now implemented as a first-class, selectable option rather
+   than deferred.
+5. Manual review — identical intent to A: confirm the table still has BOTH
+   the legacy mechanism and (now catalog-scoped) ABAC coverage before
+   anything is removed. Existing-ABAC-policy detection for this scope
+   cannot use `SHOW POLICIES ON TABLE` (the policy isn't attached to the
+   table) — `CatalogBasedPolicyStrategy.find_existing_row_filter_policy`/
+   `find_existing_mask_policies` instead recover state from the governed
+   **column tag** already present on the table's column(s), which is
+   scope-agnostic ground truth.
+6. Remove the table-level legacy row filter/column masks (`FINALIZE`) —
+   **only this table's legacy mechanism is removed**; the shared `ON
+   CATALOG` policy itself is left untouched (and keeps protecting every
+   sibling table using the same tag/function), so finalizing table A never
+   affects table B's in-flight migration even though they share one policy
+   object underneath.
+
+Trade-off of B vs. A: far fewer policy objects for a large migration (one
+per distinct legacy function, not one per table/masked-column), at the
+cost of a coarser blast radius if that one policy is ever misconfigured or
+dropped (it now protects every table using that function, not just one).
+Both scopes are exercised end-to-end in
+`tests/test_catalog_scope_e2e.py`/`test_migration_engine.py`.
 
 ### 7.5 Eligibility rules (evaluated during `INVENTORY`)
 
@@ -815,7 +868,7 @@ Rules:
 | `continue_on_error` | bool | `true` | |
 | `max_parallelism` | int | `4` | thread-pool size in `migration_engine`; table_converter remains safely callable with `max_parallelism=1` for troubleshooting a single table |
 | `audit_catalog` / `audit_schema` / `audit_table` | str | none — required, no hard-coded default per-customer name | |
-| `policy_strategy` | str enum | `TABLE_BASED` | `TABLE_BASED`\|`FUNCTION_BASED` (§7.3) |
+| `policy_scope` | str enum | `TABLE` | `TABLE`\|`CATALOG` (§7.3.1) — "table level application" (`ON TABLE`, one policy per table/masked column) vs. "catalog level application" (`ON CATALOG`, one policy per legacy function shared by every table that used it) |
 | `policy_to_principals` | JSON array (str) | `["account users"]` | overridable if an org wants a narrower default `TO` clause |
 | `policy_except_principals` | JSON array (str) | `[]` | principals fully exempted (`TO ... EXCEPT principal [, ...]`, confirmed live CREATE POLICY grammar) from every ABAC policy this run creates - e.g. a service principal that runs unmasked ETL, or a break-glass admin group. Empty = no `EXCEPT` clause, unchanged prior behavior |
 | `enable_llm_pii_tagging` | bool | `false` | `INVENTORY`-only, advisory: classify each legacy function's likely PII category via `ai_query()` from its name+columns alone (never row data) |
@@ -863,7 +916,7 @@ abac_migration/
 │   ├── __init__.py
 │   ├── migration_engine.py            # top-level orchestrator
 │   ├── table_converter.py             # convert_table(table_ref, options) -> ConversionResult
-│   ├── policy_strategy.py             # PolicyStrategy, TableBasedPolicyStrategy, FunctionBasedPolicyStrategy
+│   ├── policy_strategy.py             # PolicyStrategy, TableBasedPolicyStrategy, CatalogBasedPolicyStrategy (§7.3.1)
 │   ├── tag_provisioner.py             # governed-tag reuse/provisioning, serialized "Prepare Tags" phase (§7.4)
 │   └── plugins/
 │       ├── __init__.py
@@ -960,7 +1013,7 @@ assumed by this design.
 
 | Risk / Edge case | Mitigation |
 |---|---|
-| Same security function shared by many tables | `TableBasedPolicyStrategy` creates one policy per table regardless (policy names are securable-scoped, so no collision); `FunctionBasedPolicyStrategy` explicitly deferred (§7.3) rather than attempted unsafely now |
+| Same security function shared by many tables | `TableBasedPolicyStrategy` creates one policy per table regardless (policy names are securable-scoped, so no collision); `CatalogBasedPolicyStrategy` (§7.3.1, `policy_scope=CATALOG`) instead consolidates them into one shared `ON CATALOG` policy by design — selectable per run |
 | Table has RLS but no masks, or vice versa, or neither | `applies_to()` per plugin makes each independently optional; `NOT_ELIGIBLE` when neither present |
 | Multiple masked columns, one function shared across columns | Discovery returns a list; each `(column, function)` pair converted independently — partial failure isolated per column (§10) |
 | Existing ABAC policy already present (someone migrated manually, or pre-existing unrelated policy) | `EXISTING_ABAC_POLICY_CONFLICT` if it doesn't match desired spec — never silently overwritten; `ALREADY_MIGRATED` if it matches (idempotent) |

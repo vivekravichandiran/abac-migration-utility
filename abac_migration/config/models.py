@@ -40,9 +40,22 @@ class ScopeType(str, Enum):
     SPECIFIC_TABLES = "SPECIFIC_TABLES"
 
 
-class PolicyStrategyType(str, Enum):
-    TABLE_BASED = "TABLE_BASED"
-    FUNCTION_BASED = "FUNCTION_BASED"
+class PolicyScope(str, Enum):
+    """Selects which `migration/policy_strategy.py` implementation a run
+    uses (§7.3) - the user-facing "Table level application" vs "Catalog
+    level application" choice, set once per run via YAML/job parameter
+    (`policy_scope`), never mixed within one run.
+
+    TABLE: `TableBasedPolicyStrategy` - one ABAC policy per table (per
+    masked column for COLUMN_MASK). The default; unchanged pre-existing
+    behavior.
+
+    CATALOG: `CatalogBasedPolicyStrategy` - one ABAC policy per distinct
+    legacy function, `ON CATALOG`, shared by every table in that catalog
+    the function used to govern. Fewer policy objects for a large
+    migration; each one now governs many tables at once."""
+    TABLE = "TABLE"
+    CATALOG = "CATALOG"
 
 
 DEFAULT_POLICY_TO_PRINCIPALS = ["account users"]
@@ -83,7 +96,7 @@ class RunConfig:
     audit_table: str = "migration_audit"
     inventory_table: str = "inventory"
 
-    policy_strategy: PolicyStrategyType = PolicyStrategyType.TABLE_BASED
+    policy_scope: PolicyScope = PolicyScope.TABLE
     policy_to_principals: list = field(default_factory=lambda: list(DEFAULT_POLICY_TO_PRINCIPALS))
     # Principals (users/groups/service principals) fully exempted from every
     # ABAC policy this run creates (`EXCEPT principal [, ...]`, confirmed
@@ -176,8 +189,8 @@ class RunConfig:
             data["mode"] = Mode(data["mode"])
         if "scope_type" in data and not isinstance(data["scope_type"], ScopeType):
             data["scope_type"] = ScopeType(data["scope_type"])
-        if "policy_strategy" in data and not isinstance(data["policy_strategy"], PolicyStrategyType):
-            data["policy_strategy"] = PolicyStrategyType(data["policy_strategy"])
+        if "policy_scope" in data and not isinstance(data["policy_scope"], PolicyScope):
+            data["policy_scope"] = PolicyScope(data["policy_scope"])
 
         for bool_field in ("dry_run", "continue_on_error", "prefer_existing_tags", "enable_llm_pii_tagging"):
             if bool_field in data and isinstance(data[bool_field], str):

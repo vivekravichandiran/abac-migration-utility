@@ -90,6 +90,28 @@ variables:
       covers - deliberately explicit rather than ALL_CATALOGS (see
       resources/jobs.yml). Override per workspace/target.
     default: '["ril_raw","ril_curated","ril_bulk","ril_migration","ril_sandbox"]'
+  policy_scope:
+    description: >-
+      Selects the ABAC policy-attachment strategy used by every mutating
+      job (abac_migration_job, abac_migration_apply_abac_job,
+      abac_migration_finalize_job) - see DESIGN.md §7.3.1 / SOP.md §2.1.
+      `TABLE` = "table level application" (default): one ABAC policy
+      `ON TABLE` per table / per masked column, exclusive to that table.
+      `CATALOG` = "catalog level application": one ABAC policy `ON CATALOG`
+      per legacy function, shared by every table that function used to
+      guard. Must be the same value across Inventory -> Apply ABAC ->
+      Finalize for one migration; changing it mid-pipeline produces
+      incorrect eligibility/state detection.
+    default: "TABLE"
+  policy_except_principals:
+    description: >-
+      JSON list of principals fully exempted (`TO account users EXCEPT
+      <principal>, ...`) from every ABAC policy the mutating jobs create
+      (abac_migration_job, abac_migration_apply_abac_job) - e.g. a service
+      principal running unmasked ETL, or a break-glass admin group.
+      Exempted principals see fully unmasked/unfiltered data. Empty (the
+      default) omits the `EXCEPT` clause entirely - unchanged behavior.
+    default: "[]"
 
 targets:
   source:

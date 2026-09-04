@@ -20,7 +20,7 @@ WIDGET_NAMES = [
     "audit_schema",
     "audit_table",
     "inventory_table",
-    "policy_strategy",
+    "policy_scope",
     "policy_to_principals",
     "policy_except_principals",
     "prefer_existing_tags",
@@ -43,7 +43,9 @@ WIDGET_DEFAULTS = {
     "audit_schema": "",
     "audit_table": "migration_audit",
     "inventory_table": "inventory",
-    "policy_strategy": "TABLE_BASED",
+    # "TABLE" ("table level application") | "CATALOG" ("catalog level
+    # application") - see config/models.py PolicyScope / DESIGN.md §7.3.
+    "policy_scope": "TABLE",
     "policy_to_principals": '["account users"]',
     "policy_except_principals": "[]",
     "prefer_existing_tags": "true",

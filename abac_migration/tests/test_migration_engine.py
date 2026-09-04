@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from ..config.models import Mode, RunConfig, ScopeType
-from ..migration.migration_engine import run
+from ..config.models import Mode, PolicyScope, RunConfig, ScopeType
+from ..migration.migration_engine import build_policy_strategy, run
+from ..migration.policy_strategy import CatalogBasedPolicyStrategy, TableBasedPolicyStrategy
+from ..migration.tag_provisioner import tag_key_for_function
 from ..uc_gateway.models import TableRef
 from .fake_gateway import FakeUnityCatalogGateway
 
@@ -127,3 +129,55 @@ def test_finalize_persists_audit_rows_with_finalized_migration_phase():
 
     insert_stmts = [s for s in fake.generic_sql_log if s.startswith("INSERT INTO") and "migration_audit" in s]
     assert any("FINALIZED" in s for s in insert_stmts)
+
+
+# ---------------------------------------------------------------------------
+# policy_scope config (§7.3): "table level application" (default) vs
+# "catalog level application", selected once per run via YAML/job param,
+# never branched on anywhere except build_policy_strategy().
+# ---------------------------------------------------------------------------
+
+def test_build_policy_strategy_defaults_to_table_based():
+    strategy = build_policy_strategy(_config())
+    assert isinstance(strategy, TableBasedPolicyStrategy)
+
+
+def test_build_policy_strategy_selects_catalog_based():
+    strategy = build_policy_strategy(_config(policy_scope=PolicyScope.CATALOG))
+    assert isinstance(strategy, CatalogBasedPolicyStrategy)
+
+
+def test_build_policy_strategy_propagates_principals_regardless_of_scope():
+    strategy = build_policy_strategy(_config(
+        policy_scope=PolicyScope.CATALOG,
+        policy_to_principals=["some_group"], policy_except_principals=["etl_sp"],
+    ))
+    assert strategy.to_principals == ["some_group"]
+    assert strategy.except_principals == ["etl_sp"]
+
+
+def test_catalog_scope_apply_abac_mode_shares_one_policy_across_tables():
+    fake = _fake_with_n_tables(3)
+
+    summary = run(_config(mode=Mode.APPLY_ABAC, policy_scope=PolicyScope.CATALOG), fake)
+
+    assert summary.tables_abac_applied == 3
+    for i in range(3):
+        assert fake.row_filters[f"cat.sch.t{i}"] is not None  # legacy untouched
+    tag_key = tag_key_for_function(RF_FN, "row_filter")
+    # One shared CATALOG-scoped policy for all 3 tables, not one each.
+    assert len(fake.policies.get("cat", {})) == 1
+    assert tag_key in fake.policies["cat"]
+
+
+def test_catalog_scope_finalize_mode_removes_legacy_for_all_tables():
+    fake = _fake_with_n_tables(3)
+    run(_config(mode=Mode.APPLY_ABAC, policy_scope=PolicyScope.CATALOG), fake)
+
+    summary = run(_config(mode=Mode.FINALIZE, run_id="finalize-run", policy_scope=PolicyScope.CATALOG), fake)
+
+    assert summary.tables_succeeded == 3
+    for i in range(3):
+        assert fake.row_filters[f"cat.sch.t{i}"] is None
+    tag_key = tag_key_for_function(RF_FN, "row_filter")
+    assert tag_key in fake.policies["cat"]  # shared policy still lives on

@@ -38,6 +38,19 @@ _FAKE_PII_KEYWORD_MAP = [
 ]
 
 
+def _securable_key(on_securable: str) -> str:
+    """Normalizes a strategy-produced `ON <securable>` string (e.g.
+    ``TABLE `cat`.`sch`.`tbl` `` or ``CATALOG `cat` ``) into a plain,
+    backtick-free dict key by dropping the leading securable-type keyword -
+    ``TABLE `cat`.`sch`.`tbl` `` -> `"cat.sch.tbl"` (identical to
+    `table.full_name`, preserving every pre-existing test's direct
+    `fake.policies[table.full_name]` access), ``CATALOG `cat` `` -> `"cat"`.
+    Mirrors what the real gateway does implicitly by just interpolating the
+    already-quoted string into SQL; this in-memory fake needs an explicit
+    hashable key instead."""
+    return on_securable.split(" ", 1)[1].replace("`", "")
+
+
 class FakeUnityCatalogGateway:
     def __init__(self):
         self.catalogs = set()
@@ -87,8 +100,16 @@ class FakeUnityCatalogGateway:
         self.functions.add(function_fqn)
 
     def add_existing_policy(self, table: TableRef, policy_def: PolicyDefinition) -> None:
+        """Seeds a TABLE-scoped ("table level application") existing policy."""
         self.register_table(table)
         self.policies[table.full_name][policy_def.name] = policy_def
+
+    def add_existing_catalog_policy(self, catalog: str, policy_def: PolicyDefinition) -> None:
+        """Seeds a CATALOG-scoped ("catalog level application") existing
+        policy - i.e. a policy `CatalogBasedPolicyStrategy` would have
+        created, not tied to any single table."""
+        self.catalogs.add(catalog)
+        self.policies.setdefault(catalog, {})[policy_def.name] = policy_def
 
     def add_column_tag(self, table: TableRef, column: str, tag_key: str, tag_value) -> None:
         self.register_table(table)
@@ -106,8 +127,13 @@ class FakeUnityCatalogGateway:
     def fail_next_create_policy(self, error_code: str = "POLICY_CREATE_FAILED", error_message: str = "injected failure") -> None:
         self._create_policy_failure = (error_code, error_message)
 
-    def override_describe_policy(self, table: TableRef, policy_name: str, policy_def: PolicyDefinition) -> None:
-        self._describe_policy_override[(table.full_name, policy_name)] = policy_def
+    def override_describe_policy(self, on_securable, policy_name: str, policy_def: PolicyDefinition) -> None:
+        """`on_securable` accepts either the strategy-style string (e.g.
+        ``TABLE `cat`.`sch`.`tbl` ``) or, for backward compatibility with
+        every pre-existing table-scope test, a bare `TableRef` (implicitly
+        treated as `TABLE <that table>`)."""
+        key = _securable_key(f"TABLE {on_securable.quoted_full_name}") if isinstance(on_securable, TableRef) else _securable_key(on_securable)
+        self._describe_policy_override[(key, policy_name)] = policy_def
 
     def _maybe_raise(self, method_name: str) -> None:
         exc = self._raise_on.pop(method_name, None)
@@ -136,19 +162,25 @@ class FakeUnityCatalogGateway:
             column_masks=list(self.column_masks.get(table.full_name, {}).values()),
         )
 
-    def show_policies(self, table: TableRef) -> list:
+    def show_policies(self, on_securable: str) -> list:
         self._maybe_raise("show_policies")
+        key = _securable_key(on_securable)
+        parts = key.split(".")
+        catalog = parts[0] if len(parts) >= 1 else None
+        schema = parts[1] if len(parts) >= 2 else None
+        table_name = parts[2] if len(parts) >= 3 else None
         return [
-            PolicyRef(policy_name=name, policy_type=d.policy_type, catalog=table.catalog, schema=table.schema, table=table.table)
-            for name, d in self.policies.get(table.full_name, {}).items()
+            PolicyRef(policy_name=name, policy_type=d.policy_type, catalog=catalog, schema=schema, table=table_name)
+            for name, d in self.policies.get(key, {}).items()
         ]
 
-    def describe_policy(self, table: TableRef, policy_name: str):
+    def describe_policy(self, on_securable: str, policy_name: str):
         self._maybe_raise("describe_policy")
-        override = self._describe_policy_override.get((table.full_name, policy_name))
+        key = _securable_key(on_securable)
+        override = self._describe_policy_override.get((key, policy_name))
         if override is not None:
             return override
-        return self.policies.get(table.full_name, {}).get(policy_name)
+        return self.policies.get(key, {}).get(policy_name)
 
     def function_exists(self, function_fqn: str) -> bool:
         self._maybe_raise("function_exists")
@@ -170,26 +202,29 @@ class FakeUnityCatalogGateway:
 
         self._maybe_raise("create_or_replace_policy")
         self.mutation_calls.append(("create_or_replace_policy", spec.policy_name))
-        # on_securable is "TABLE `cat`.`schema`.`table`" (real gateway always
-        # backtick-quotes it) - strip backticks to recover the plain dotted
-        # fqn used as the dict key everywhere else in this fake.
-        table_fqn = spec.on_securable.split(" ", 1)[1].replace("`", "")
+        # spec.on_securable is e.g. "TABLE `cat`.`schema`.`table`" or
+        # "CATALOG `cat`" (real gateway always backtick-quotes it) - _securable_key
+        # strips the leading keyword + backticks to get the dict key used
+        # everywhere else in this fake ("cat.schema.table" / "cat").
+        securable_key = _securable_key(spec.on_securable)
+        on_securable_type = spec.on_securable.split(" ", 1)[0]
         policy_def = PolicyDefinition(
-            name=spec.policy_name, policy_type=spec.policy_type, on_securable_type="TABLE", on_securable=table_fqn,
+            name=spec.policy_name, policy_type=spec.policy_type, on_securable_type=on_securable_type,
+            on_securable=securable_key,
             to_principals=list(spec.to_principals), match_columns=[mc.alias for mc in spec.match_columns],
             function_fqn=spec.function_fqn, using_columns=list(spec.using_columns), on_column_alias=spec.mask_target_alias,
             except_principals=list(spec.except_principals),
         )
-        self.policies.setdefault(table_fqn, {})[spec.policy_name] = policy_def
+        self.policies.setdefault(securable_key, {})[spec.policy_name] = policy_def
         return PolicyApplyResult(success=True, policy_name=spec.policy_name, statement_text="-- fake --")
 
-    def drop_policy(self, table: TableRef, policy_name: str, dry_run: bool) -> None:
+    def drop_policy(self, on_securable: str, policy_name: str, dry_run: bool) -> None:
         if dry_run:
             self.dry_run_calls.append(("drop_policy", policy_name))
             return
         self._maybe_raise("drop_policy")
         self.mutation_calls.append(("drop_policy", policy_name))
-        self.policies.get(table.full_name, {}).pop(policy_name, None)
+        self.policies.get(_securable_key(on_securable), {}).pop(policy_name, None)
 
     def drop_row_filter(self, table: TableRef, dry_run: bool) -> None:
         if dry_run:

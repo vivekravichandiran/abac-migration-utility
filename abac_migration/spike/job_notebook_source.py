@@ -147,7 +147,7 @@ audit_repo = AuditRepository(uc, f"{AUDIT_CATALOG}.{AUDIT_SCHEMA}", f"{AUDIT_CAT
 before = detect_drift(drift_table, audit_repo, uc, strategy)
 print("drift check BEFORE external tamper:", before)
 
-uc.drop_policy(drift_table, "abac_migrated_row_filter", dry_run=False)
+uc.drop_policy(strategy.on_securable_for(drift_table), "abac_migrated_row_filter", dry_run=False)
 print("Externally dropped the ABAC row-filter policy on rollback_demo_tbl (simulating out-of-band change).")
 
 after = detect_drift(drift_table, audit_repo, uc, strategy)

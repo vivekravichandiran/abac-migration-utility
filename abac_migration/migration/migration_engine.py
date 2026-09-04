@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..audit.audit_repository import AuditRepository, MigrationAuditRecord
-from ..config.models import Mode, RunConfig
+from ..config.models import Mode, PolicyScope, RunConfig
 from ..inventory.inventory_manager import build_inventory_record
 from ..inventory.inventory_repository import InventoryRepository
 from ..rollback.rollback_manager import rollback_table
@@ -23,9 +23,23 @@ from ..validation.post_validation import verify_table
 from .plugins.base_plugin import StepStatus
 from .plugins.mask_to_abac import ColumnMaskMigrationPlugin
 from .plugins.rls_to_abac import RLSMigrationPlugin
-from .policy_strategy import PolicyStrategy, TableBasedPolicyStrategy
+from .policy_strategy import CatalogBasedPolicyStrategy, PolicyStrategy, TableBasedPolicyStrategy
 from .table_converter import ConversionResult, convert_table
 from .tag_provisioner import TagProvisioner
+
+# §7.3: the only place `RunConfig.policy_scope` gets turned into an actual
+# PolicyStrategy instance - every other component takes a PolicyStrategy
+# object, never the enum, which is what keeps them oblivious to how many
+# scope choices exist.
+_STRATEGY_BY_SCOPE = {
+    PolicyScope.TABLE: TableBasedPolicyStrategy,
+    PolicyScope.CATALOG: CatalogBasedPolicyStrategy,
+}
+
+
+def build_policy_strategy(config: RunConfig) -> PolicyStrategy:
+    strategy_cls = _STRATEGY_BY_SCOPE[config.policy_scope]
+    return strategy_cls(to_principals=config.policy_to_principals, except_principals=config.policy_except_principals)
 
 
 @dataclass
@@ -61,9 +75,7 @@ def run(config: RunConfig, uc: UnityCatalogGateway) -> RunSummary:
     audit_repo.ensure_tables_exist(dry_run=config.dry_run)
     inventory_repo = InventoryRepository(uc, config.inventory_table_fqn)
 
-    strategy: PolicyStrategy = TableBasedPolicyStrategy(
-        to_principals=config.policy_to_principals, except_principals=config.policy_except_principals,
-    )
+    strategy: PolicyStrategy = build_policy_strategy(config)
 
     if config.mode == Mode.ROLLBACK:
         summary.other_results = _run_rollback(config, uc, audit_repo, strategy)

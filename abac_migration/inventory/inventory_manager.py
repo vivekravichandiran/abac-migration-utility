@@ -12,7 +12,7 @@ from typing import Optional
 from ..config.models import DEFAULT_PII_LLM_ENDPOINT
 from ..discovery.mask_discovery import discover_column_masks
 from ..discovery.rls_discovery import discover_row_filter
-from ..migration.policy_strategy import PolicyStrategy
+from ..migration.policy_strategy import PolicyStrategy, TableBasedPolicyStrategy
 from ..uc_gateway.gateway import UCGatewayError, UnityCatalogGateway, is_permission_denied
 from ..uc_gateway.models import TableRef
 
@@ -52,16 +52,28 @@ class InventoryRecord:
 
 def build_inventory_record(
     table: TableRef, uc: UnityCatalogGateway, run_id: str,
-    policy_strategy: Optional[PolicyStrategy] = None,  # unused now (see _evaluate_eligibility); kept for API stability
+    policy_strategy: Optional[PolicyStrategy] = None,
     enable_llm_pii_tagging: bool = False,
     pii_llm_endpoint: str = DEFAULT_PII_LLM_ENDPOINT,
 ) -> InventoryRecord:
-    del policy_strategy
+    strategy = policy_strategy or TableBasedPolicyStrategy()
     try:
         state = uc.describe_table_security(table)
         row_filter = discover_row_filter(table, uc)
         column_masks = discover_column_masks(table, uc)
-        existing_policies = uc.show_policies(table)
+        # Scope-aware existing-ABAC-policy detection (§7.3): delegates to
+        # the strategy rather than a bare `uc.show_policies(table)` so this
+        # is precise for BOTH "table level application" (direct, ON TABLE
+        # policies only) AND "catalog level application" (recovered via
+        # this table's own governed column tags, since a CATALOG-scoped
+        # policy is never directly "on" any one table - see
+        # CatalogBasedPolicyStrategy.find_existing_*_policy docstrings).
+        existing_row_filter = strategy.find_existing_row_filter_policy(table, uc)
+        existing_masks = strategy.find_existing_mask_policies(table, uc)
+        existing_policy_names = (
+            ([existing_row_filter.name] if existing_row_filter is not None else [])
+            + [m.policy_def.name for m in existing_masks]
+        )
     except UCGatewayError as exc:
         if not is_permission_denied(exc):
             raise
@@ -78,7 +90,7 @@ def build_inventory_record(
             migration_eligibility="NOT_ELIGIBLE", eligibility_reason="PERMISSION_DENIED",
         )
 
-    eligibility, reason = _evaluate_eligibility(state, existing_policies)
+    eligibility, reason = _evaluate_eligibility(state, existing_policy_names)
 
     row_filter_pii_tag = None
     column_mask_pii_tags: dict = {}
@@ -98,8 +110,8 @@ def build_inventory_record(
         row_filter_expression_text=row_filter.raw_text if row_filter else "",
         has_column_masks=len(column_masks) > 0,
         column_masks=[{"column": m.column, "function": m.function_fqn} for m in column_masks],
-        has_existing_abac_policy=len(existing_policies) > 0,
-        existing_abac_policy_names=[p.policy_name for p in existing_policies],
+        has_existing_abac_policy=len(existing_policy_names) > 0,
+        existing_abac_policy_names=existing_policy_names,
         migration_eligibility=eligibility,
         eligibility_reason=reason,
         row_filter_suggested_pii_tag=row_filter_pii_tag,

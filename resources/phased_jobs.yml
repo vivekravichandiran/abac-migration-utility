@@ -10,8 +10,12 @@ resources:
         classifies each legacy row-filter/column-mask function's likely PII
         category from its name + governed column(s) alone, via ai_query() -
         purely advisory, recorded on the inventory table, never affects
-        eligibility. Run this first, review the inventory table, then run
-        "ABAC Migration - 2. Apply ABAC".
+        eligibility. `policy_scope` (`TABLE` default | `CATALOG`) must match
+        what you intend to run Apply-ABAC/Finalize with, since it changes
+        which existing-ABAC-policy state INVENTORY looks for (a table-scoped
+        policy `ON TABLE` vs. a catalog-scoped one `ON CATALOG` recovered via
+        governed column tags only). Run this first, review the inventory
+        table, then run "ABAC Migration - 2. Apply ABAC".
       max_concurrent_runs: 1
       tasks:
         - task_key: run_inventory
@@ -28,7 +32,7 @@ resources:
               max_parallelism: "4"
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
-              policy_strategy: "TABLE_BASED"
+              policy_scope: ${var.policy_scope}
               prefer_existing_tags: "true"
               enable_llm_pii_tagging: "true"
           environment_key: default
@@ -49,7 +53,12 @@ resources:
         never a security gap (strictly additive). Recorded in
         migration_audit with migration_phase=ABAC_APPLIED (explicitly not
         final). Run "ABAC Migration - 3. Finalize" once you've reviewed/
-        confirmed the new policies look correct. Override
+        confirmed the new policies look correct. Override `policy_scope` to
+        choose `TABLE` ("table level application", default - one policy per
+        table/masked column, `ON TABLE`) or `CATALOG` ("catalog level
+        application" - one policy per legacy function, `ON CATALOG`, shared
+        by every table that function used to govern). Must match the value
+        used for Inventory and Finalize in the same pipeline run. Override
         `policy_except_principals` (JSON array, default `[]`) to exempt
         specific principals - e.g. a service principal running unmasked
         ETL - from every ABAC policy this run creates.
@@ -69,8 +78,8 @@ resources:
               max_parallelism: "4"
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
-              policy_strategy: "TABLE_BASED"
-              policy_except_principals: "[]"
+              policy_scope: ${var.policy_scope}
+              policy_except_principals: ${var.policy_except_principals}
               prefer_existing_tags: "true"
           environment_key: default
       environments:
@@ -88,6 +97,10 @@ resources:
         (NOT_ELIGIBLE/ABAC_NOT_APPLIED_YET) for anything Apply-ABAC hasn't
         touched yet - never creates a policy itself. Recorded in
         migration_audit with migration_phase=FINALIZED on success.
+        `policy_scope` must match what Inventory/Apply-ABAC used for this
+        `catalogs` scope (`TABLE` default | `CATALOG`) - it determines
+        which ABAC policy Finalize looks for before removing the legacy
+        row filter/column mask.
       max_concurrent_runs: 1
       tasks:
         - task_key: run_finalize
@@ -104,7 +117,7 @@ resources:
               max_parallelism: "4"
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
-              policy_strategy: "TABLE_BASED"
+              policy_scope: ${var.policy_scope}
               prefer_existing_tags: "true"
           environment_key: default
       environments:

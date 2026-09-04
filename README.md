@@ -143,6 +143,39 @@ already-`FINALIZED` object reports `ALREADY_MIGRATED`. Running
 `APPLY_ABAC` immediately followed by `FINALIZE` (e.g. in a test) reaches
 the identical live-UC end state as one atomic `MIGRATE` call.
 
+### `policy_scope`: table level vs. catalog level application
+
+Every mutating mode (`MIGRATE`, `APPLY_ABAC`, `FINALIZE`, `ROLLBACK`) reads
+a `policy_scope` parameter (`TABLE` default | `CATALOG`, `RunConfig.policy_scope`)
+that selects which `PolicyStrategy` (`migration/policy_strategy.py`) is used
+for the entire run. Identifying legacy security, minting one governed tag
+per legacy function, and tagging the relevant column(s) is identical either
+way — only where the ABAC policy itself is attached differs:
+
+- **`TABLE` — table level application** (`TableBasedPolicyStrategy`): one
+  policy `ON TABLE` per table (row filter) / per masked column (column
+  mask). Exclusive to that table.
+- **`CATALOG` — catalog level application** (`CatalogBasedPolicyStrategy`):
+  one policy `ON CATALOG` **per legacy function**, shared by every table
+  that function used to guard. Fewer policy objects overall for a large
+  migration, at the cost of a wider blast radius per policy.
+
+`FINALIZE` under `CATALOG` scope only ever removes *that table's* legacy
+row filter/mask — the shared catalog-scoped policy itself is left running
+for any sibling table that hasn't been finalized yet. Use the same
+`policy_scope` value across `INVENTORY`/`APPLY_ABAC`/`FINALIZE` for one
+migration — see `abac_migration/DESIGN.md` §7.3.1 for the full design and
+`SOP.md` §2.1 for the operator-facing runbook.
+
+### `policy_except_principals`: excluding principals from every policy
+
+All mutating modes also read `policy_except_principals` (JSON array,
+default `[]`) — principals listed here are added to an `EXCEPT` clause on
+every ABAC policy the run creates (`TO account users EXCEPT <principal>`)
+and see fully unmasked/unfiltered data. Typical use: a service principal
+running unmasked ETL, or a break-glass admin group. Empty means no `EXCEPT`
+clause is generated at all.
+
 ### `VERIFY`
 
 Read-only. For every table in scope, re-runs the same discover/verify

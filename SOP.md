@@ -74,6 +74,46 @@ their reasoning, only the operating steps.
 | 7 | `RECONCILE` | Compare live state against the audit table's last-known-good record → drift or not. | No |
 | 8 | `ROLLBACK` | Undo one specific prior run by `run_id`: restore legacy, remove that run's ABAC policy. | Yes (unless `dry_run=true`) |
 
+### 2.1 Policy scope: `TABLE` vs. `CATALOG` — two ways to apply ABAC policies
+
+Every mutating mode above (`MIGRATE`, `APPLY_ABAC`, `FINALIZE`, and
+`ROLLBACK`) also reads a **`policy_scope`** parameter that answers *where*
+the new ABAC policy actually gets attached. Steps 1-3 are identical either
+way — only step 4 onward differs:
+
+1. Identify legacy row filter / column masks on the table.
+2. Create one governed tag per legacy function.
+3. Apply that tag to the relevant column(s) on the table.
+4. Create the ABAC policy — **scope depends on `policy_scope`** (see below).
+5. Manual review — confirm the table has BOTH the legacy mechanism and the
+   new ABAC policy, and that they produce identical results.
+6. Remove the table-level legacy row filter/column masks.
+
+| `policy_scope` | Name | Step 4 | Step 6 |
+|---|---|---|---|
+| `TABLE` (default) | **Table level application** | One ABAC policy `ON TABLE` per table (row filter) / per masked column (column mask) | Removes this table's legacy security; policy is exclusive to this table |
+| `CATALOG` | **Catalog level application** | One ABAC policy `ON CATALOG` (the catalog the *legacy function* lives in) **per legacy function** — shared by every table that function used to guard | Removes only this table's legacy security; the shared `ON CATALOG` policy is left in place, still protecting sibling tables using the same function |
+
+Pick `TABLE` (the default) unless you specifically want to consolidate many
+tables that share the same legacy security function into one policy object
+— `CATALOG` trades more objects-per-table for fewer objects overall, at the
+cost of a wider blast radius if that one shared policy is ever
+misconfigured. **Use the same `policy_scope` value across `INVENTORY` →
+`APPLY_ABAC` → `FINALIZE` for a given scope** — it changes how each phase
+detects "does this table already have an ABAC policy?", so mixing values
+mid-pipeline will produce confusing/incorrect eligibility results.
+
+### 2.2 Excluding principals from every policy: `policy_except_principals`
+
+Every mutating mode also reads **`policy_except_principals`** (JSON array
+of principal names, default `[]`). Listed principals are added to an
+`EXCEPT` clause on every ABAC policy the run creates (`TO account users
+EXCEPT <principal>, ...`) and see **fully unmasked/unfiltered data**,
+regardless of what the underlying legacy security function would otherwise
+compute. Typical use: a service principal running unmasked ETL, or a
+break-glass admin group. Leave empty (the default) for no exemptions —
+generated SQL is unchanged from before this option existed.
+
 ---
 
 ## 3. One-time setup (do this once per workspace)
@@ -345,6 +385,7 @@ before committing to removing the old ones.
    | `mode` | `APPLY_ABAC` (already the job's default) | |
    | `scope_type` / `catalogs` etc. | your scope | |
    | `audit_catalog` / `audit_schema` | same as inventory | |
+   | `policy_scope` | `TABLE` or `CATALOG` | must match what `INVENTORY` and `FINALIZE` use for this scope — see §2.1 |
    | `dry_run` | `true` first, then `false` | same dry-run-first pattern as `MIGRATE` |
 
 3. Run with `dry_run=true` first, review `tables_would_migrate`, then rerun
@@ -355,9 +396,15 @@ before committing to removing the old ones.
      `status = ABAC_APPLIED` and `migration_phase = ABAC_APPLIED` (explicit
      "not final yet" marker).
    - Spot-check a table live: `DESCRIBE TABLE EXTENDED <table>` should still
-     show the legacy **Row Filter** / **Column Masks** section, and
-     `SHOW POLICIES ON TABLE <table>` should now also list the new
-     `abac_migrated_...` policy/policies.
+     show the legacy **Row Filter** / **Column Masks** section. If
+     `policy_scope=TABLE`, `SHOW POLICIES ON TABLE <table>` should now also
+     list the new `abac_migrated_...` policy/policies. If
+     `policy_scope=CATALOG`, the policy is **not** attached to the table —
+     instead run `SHOW POLICIES ON CATALOG <catalog>` (the catalog the
+     legacy function lives in) and confirm the column now carries the
+     matching governed tag (`SELECT * FROM
+     <audit_catalog>.information_schema.column_tags WHERE table_name =
+     '<table>'`).
    - Query the table as different test users/roles to confirm the new ABAC
      policy behaves as expected (masking/filtering correctly) — this is your
      chance to catch a wrong policy **before** the old safety net is removed.
@@ -392,6 +439,7 @@ step 1.
    | `mode` | `FINALIZE` (already the job's default) | |
    | `scope_type` / `catalogs` etc. | same scope as step 1 | |
    | `audit_catalog` / `audit_schema` | same as before | |
+   | `policy_scope` | same value used for `APPLY_ABAC` | required to correctly recover the ABAC policy state — see §2.1 |
    | `dry_run` | `true` first, then `false` | |
 
 3. Run with `dry_run=true` first, then `dry_run=false`.
@@ -400,8 +448,12 @@ step 1.
 5. Verify: query `migration_audit` — those rows should now show
    `status = SUCCESS`, `migration_phase = FINALIZED`. Spot-check a table
    live with `DESCRIBE TABLE EXTENDED <table>` — the legacy **Row Filter** /
-   **Column Masks** section should now be **gone**; `SHOW POLICIES ON TABLE`
-   should still list the ABAC policy.
+   **Column Masks** section should now be **gone**. If `policy_scope=TABLE`,
+   `SHOW POLICIES ON TABLE` should still list the ABAC policy. If
+   `policy_scope=CATALOG`, the policy was never on the table to begin with
+   and is untouched by this step — confirm it's still live with
+   `SHOW POLICIES ON CATALOG <catalog>` (it also still covers any sibling
+   table sharing that legacy function that hasn't been finalized yet).
 6. Optionally run `VERIFY` (§6.6) right after, on the same scope, as an
    independent double-check.
 
@@ -643,7 +695,7 @@ Find its `run_id` in `migration_audit` → `ROLLBACK` with `dry_run=true`
 | `max_parallelism` | mutating modes | `4` | thread-pool size for per-table conversion |
 | `audit_catalog` / `audit_schema` | all | *(required, no default)* | where `inventory`/`migration_audit` live |
 | `audit_table` / `inventory_table` | all | `migration_audit` / `inventory` | table names within `audit_schema` |
-| `policy_strategy` | mutating modes | `TABLE_BASED` | `TABLE_BASED` \| `FUNCTION_BASED` |
+| `policy_scope` | mutating modes | `TABLE` | `TABLE` \| `CATALOG` — see §2A/§2B below. Must be the same value across `INVENTORY` → `APPLY_ABAC` → `FINALIZE` for one migration; the tool cannot detect if you mix scopes across the isolated phases |
 | `policy_to_principals` | mutating modes | `["account users"]` | JSON list |
 | `policy_except_principals` | mutating modes | `[]` | JSON list of users/groups/service principals to **exempt** from every ABAC policy this run creates (`TO ... EXCEPT <principal>`) — e.g. `["etl_service_principal"]`. Exempted principals see fully unmasked/unfiltered data. Empty = no exemptions (unchanged behavior) |
 | `prefer_existing_tags` | mutating modes | `true` | reuse a compatible existing governed tag instead of minting a new one, if found |

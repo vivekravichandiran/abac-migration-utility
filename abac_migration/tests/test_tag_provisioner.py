@@ -8,21 +8,21 @@ from ..migration.tag_provisioner import (
     TagProvisioner,
     TagRequest,
     _short_function_name,
-    _tag_key_for_function,
+    tag_key_for_function,
 )
 from ..uc_gateway.models import TableRef
 from .fake_gateway import FakeUnityCatalogGateway
 
 RF_FN = "cat.sch.rf_business_unit_fn"
 MASK_FN = "cat.sch.mask_email_fn"
-RF_TAG_KEY = _tag_key_for_function(RF_FN, "row_filter")
-MASK_TAG_KEY = _tag_key_for_function(MASK_FN, "mask")
+RF_TAG_KEY = tag_key_for_function(RF_FN, "row_filter")
+MASK_TAG_KEY = tag_key_for_function(MASK_FN, "mask")
 
 
 def test_tag_key_is_derived_per_function_not_shared():
     other_rf_fn = "cat.sch.rf_region_fn"
-    key_a = _tag_key_for_function(RF_FN, "row_filter")
-    key_b = _tag_key_for_function(other_rf_fn, "row_filter")
+    key_a = tag_key_for_function(RF_FN, "row_filter")
+    key_b = tag_key_for_function(other_rf_fn, "row_filter")
     assert key_a != key_b  # one governed tag KEY per function, not one shared key
     assert key_a == RF_TAG_KEY  # deterministic/stable across calls
 
@@ -30,10 +30,10 @@ def test_tag_key_is_derived_per_function_not_shared():
 def test_tag_key_includes_catalog_and_schema_with_no_hash():
     # cat.sch.rf_region_both -> abac_rls_cat_sch_rf_region_both - fully
     # qualified, deterministic, and with NO hash/digest suffix anywhere.
-    key = _tag_key_for_function("cat.sch.rf_region_both", "row_filter")
+    key = tag_key_for_function("cat.sch.rf_region_both", "row_filter")
     assert key == "abac_rls_cat_sch_rf_region_both"
 
-    mask_key = _tag_key_for_function("`some_catalog`.`some_schema`.`mask_email_fn`", "mask")
+    mask_key = tag_key_for_function("`some_catalog`.`some_schema`.`mask_email_fn`", "mask")
     assert mask_key == "abac_colmask_some_catalog_some_schema_mask_email_fn"
 
 
@@ -41,7 +41,7 @@ def test_tag_key_replaces_hyphens_with_underscores_in_catalog_and_schema():
     # Confirmed-live real case: catalog/schema names may contain hyphens
     # (e.g. `jh-demo`), which must become `_`, not be dropped or left as-is
     # (governed tag keys don't allow hyphens).
-    key = _tag_key_for_function("jh-demo.some-schema.rf_region_both", "row_filter")
+    key = tag_key_for_function("jh-demo.some-schema.rf_region_both", "row_filter")
     assert key == "abac_rls_jh_demo_some_schema_rf_region_both"
     assert "-" not in key
 

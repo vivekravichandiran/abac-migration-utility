@@ -1,6 +1,10 @@
 """RLSMigrationPlugin: discover/validate/convert/verify/rollback for the
-table-level Row Filter -> ABAC ROW_FILTER policy conversion of one table
-(§2, §5). Never touches column masks.
+Row Filter -> ABAC ROW_FILTER policy conversion of one table (§2, §5).
+Never touches column masks. Deliberately scope-agnostic: every `ON
+<securable>` clause and every deterministic policy name comes from
+`self._policy_strategy` (policy_strategy.py) - this plugin works
+identically whether the strategy is table-scoped ("table level
+application") or catalog-scoped ("catalog level application").
 """
 from __future__ import annotations
 
@@ -23,14 +27,17 @@ class RLSMigrationPlugin:
         # Legacy row filter may already have been removed by a prior
         # successful run (§7 idempotency) - still "applicable" so a rerun
         # correctly reports ALREADY_MIGRATED instead of NO_LEGACY_SECURITY_FOUND.
-        return uc.describe_policy(table, self._policy_strategy.ROW_FILTER_POLICY_NAME) is not None
+        # Delegated to the strategy since recovering "is there already a
+        # matching ABAC policy" without the legacy artifact to read the
+        # function name off of is scope-specific (see
+        # CatalogBasedPolicyStrategy.find_existing_row_filter_policy).
+        return self._policy_strategy.find_existing_row_filter_policy(table, uc) is not None
 
     def discover(self, table: TableRef, uc: UnityCatalogGateway) -> DiscoveryResult:
         state = uc.describe_table_security(table)
-        policies = uc.show_policies(table)
-        applicable = state.has_row_filter or any(
-            p.policy_name == self._policy_strategy.ROW_FILTER_POLICY_NAME for p in policies
-        )
+        on_securable = self._policy_strategy.on_securable_for(table)
+        policies = uc.show_policies(on_securable)
+        applicable = state.has_row_filter or self._policy_strategy.find_existing_row_filter_policy(table, uc) is not None
         return DiscoveryResult(applicable=applicable, security_state=state, existing_policies=policies)
 
     def validate(self, table: TableRef, discovery: DiscoveryResult, uc: UnityCatalogGateway) -> ValidationResult:
@@ -40,19 +47,17 @@ class RLSMigrationPlugin:
                 tag_requests=[], decision="NOT_ELIGIBLE", reason_code="NO_LEGACY_SECURITY_FOUND",
             )])
 
-        deterministic_name = self._policy_strategy.ROW_FILTER_POLICY_NAME
         rf = discovery.security_state.row_filter if discovery.security_state else None
-        existing_ref = next((p for p in discovery.existing_policies if p.policy_name == deterministic_name), None)
 
         if rf is None:
-            # applicable purely because a matching-named ABAC policy already
+            # applicable purely because a matching ABAC policy already
             # exists and the legacy row filter is already gone (§7).
-            if existing_ref is not None:
-                existing_def = uc.describe_policy(table, deterministic_name)
+            existing_def = self._policy_strategy.find_existing_row_filter_policy(table, uc)
+            if existing_def is not None:
                 return ValidationResult(planned_objects=[PlannedObject(
-                    masked_column=None, source_function=existing_def.function_fqn if existing_def else "",
+                    masked_column=None, source_function=existing_def.function_fqn,
                     source_using_columns=[], tag_requests=[], decision="ALREADY_MIGRATED",
-                    existing_policy_name=deterministic_name,
+                    existing_policy_name=existing_def.name,
                 )])
             return ValidationResult(planned_objects=[PlannedObject(
                 masked_column=None, source_function="", source_using_columns=[],
@@ -70,9 +75,21 @@ class RLSMigrationPlugin:
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_ACCESSIBLE",
             )])
 
+        deterministic_name = self._policy_strategy.row_filter_policy_name(rf.function_fqn)
+        on_securable = self._policy_strategy.on_securable_for(table)
+        # Membership in `discovery.existing_policies` (SHOW POLICIES) is
+        # checked BEFORE the more expensive/authoritative DESCRIBE POLICY
+        # call - not just an optimization: it also means a policy that
+        # DESCRIBE could theoretically resolve but SHOW never listed (never
+        # actually observed against real UC; only distinguishable in the
+        # in-memory test fake) is deliberately treated as "doesn't exist
+        # yet" here, so a genuine read-after-write inconsistency surfaces
+        # later as this run's own POLICY_VERIFY_FAILED instead of a
+        # pre-emptive, possibly-wrong EXISTING_ABAC_POLICY_CONFLICT.
+        existing_ref = next((p for p in discovery.existing_policies if p.policy_name == deterministic_name), None)
         abac_already_applied = False
         if existing_ref is not None:
-            existing_def = uc.describe_policy(table, deterministic_name)
+            existing_def = uc.describe_policy(on_securable, deterministic_name)
             # `rf is not None` here (legacy row filter is still live right
             # now, checked above) - so this is never "fully done" even if a
             # matching-function ABAC policy already exists: it's either a
@@ -179,7 +196,7 @@ class RLSMigrationPlugin:
                 error_code=apply_result.error_code or "POLICY_CREATE_FAILED", error_message=apply_result.error_message,
             )
 
-        verify_def = uc.describe_policy(table, spec.policy_name)
+        verify_def = uc.describe_policy(spec.on_securable, spec.policy_name)
         if verify_def is None or verify_def.function_fqn != spec.function_fqn:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
@@ -200,7 +217,6 @@ class RLSMigrationPlugin:
         ABAC policy was already applied (by a prior APPLY_ABAC or MIGRATE
         run) and do the final state verification. Never creates a policy -
         refuses (NOT_ELIGIBLE) if APPLY_ABAC hasn't run for this object yet."""
-        deterministic_name = self._policy_strategy.ROW_FILTER_POLICY_NAME
         if not obj.abac_already_applied:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.NOT_ELIGIBLE, source_function=obj.source_function,
@@ -208,9 +224,12 @@ class RLSMigrationPlugin:
                 error_message="No ABAC row-filter policy found yet for this table - run Mode.APPLY_ABAC (or MIGRATE) first.",
             )
 
+        deterministic_name = self._policy_strategy.row_filter_policy_name(obj.source_function)
+        on_securable = self._policy_strategy.on_securable_for(table)
+
         # Re-confirm right before mutating (§8 state machine: never remove
         # legacy without a fresh VALIDATE ABAC immediately before it).
-        verify_def = uc.describe_policy(table, deterministic_name)
+        verify_def = uc.describe_policy(on_securable, deterministic_name)
         if verify_def is None or verify_def.function_fqn != obj.source_function:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
@@ -220,8 +239,7 @@ class RLSMigrationPlugin:
         rollback_metadata = {
             "original_row_filter": {"function": obj.source_function, "using_columns": obj.source_using_columns},
             "abac_policies_created_by_this_run": [
-                {"policy_name": deterministic_name, "on_securable": f"TABLE {table.quoted_full_name}",
-                 "policy_type": "ROW_FILTER"},
+                {"policy_name": deterministic_name, "on_securable": on_securable, "policy_type": "ROW_FILTER"},
             ],
         }
 
@@ -282,7 +300,7 @@ class RLSMigrationPlugin:
                 error_code=apply_result.error_code or "POLICY_CREATE_FAILED", error_message=apply_result.error_message,
             )
 
-        verify_def = uc.describe_policy(table, spec.policy_name)
+        verify_def = uc.describe_policy(spec.on_securable, spec.policy_name)
         if verify_def is None or verify_def.function_fqn != spec.function_fqn:
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
@@ -314,9 +332,15 @@ class RLSMigrationPlugin:
         )
 
     def verify(self, table: TableRef, uc: UnityCatalogGateway) -> list:
-        deterministic_name = self._policy_strategy.ROW_FILTER_POLICY_NAME
-        policy_def = uc.describe_policy(table, deterministic_name)
         state = uc.describe_table_security(table)
+        if state.has_row_filter:
+            policy_def = uc.describe_policy(
+                self._policy_strategy.on_securable_for(table),
+                self._policy_strategy.row_filter_policy_name(state.row_filter.function_fqn),
+            )
+        else:
+            policy_def = self._policy_strategy.find_existing_row_filter_policy(table, uc)
+
         if policy_def is None and not state.has_row_filter:
             # RLS was never applicable to this table (mirrors applies_to()) -
             # nothing to verify here, not a failure. Without this check every
@@ -327,7 +351,7 @@ class RLSMigrationPlugin:
         if policy_def is not None and not state.has_row_filter:
             return [ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.SUCCESS,
-                source_function=policy_def.function_fqn, target_policy_name=deterministic_name,
+                source_function=policy_def.function_fqn, target_policy_name=policy_def.name,
             )]
         if policy_def is not None and state.has_row_filter:
             # Both mechanisms present - the expected, non-final resting state
@@ -336,10 +360,11 @@ class RLSMigrationPlugin:
             # don't misrepresent a normal mid-pipeline state as broken.
             return [ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.ABAC_APPLIED,
-                source_function=policy_def.function_fqn, target_policy_name=deterministic_name,
+                source_function=policy_def.function_fqn, target_policy_name=policy_def.name,
             )]
         return [ConversionStepResult(
-            object_type=self.object_type, status=StepStatus.FAILED, target_policy_name=deterministic_name,
+            object_type=self.object_type, status=StepStatus.FAILED,
+            target_policy_name=self._policy_strategy.row_filter_policy_name(state.row_filter.function_fqn),
             error_code="POLICY_VERIFY_FAILED",
         )]
 
@@ -351,7 +376,12 @@ class RLSMigrationPlugin:
         for policy_info in rollback_metadata.get("abac_policies_created_by_this_run", []):
             if policy_info.get("policy_type") != "ROW_FILTER":
                 continue
-            uc.drop_policy(table, policy_info["policy_name"], dry_run=dry_run)
+            # Uses the exact on_securable this run itself created the policy
+            # on (stored at creation time) rather than recomputing it from
+            # the CURRENT strategy - correct even if policy_scope config
+            # changed between the original run and this rollback.
+            on_securable = policy_info.get("on_securable") or self._policy_strategy.on_securable_for(table)
+            uc.drop_policy(on_securable, policy_info["policy_name"], dry_run=dry_run)
 
         if not uc.function_exists(original["function"]):
             return [ConversionStepResult(

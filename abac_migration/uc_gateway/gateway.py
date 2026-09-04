@@ -168,12 +168,18 @@ class UnityCatalogGateway(Protocol):
     def list_schemas(self, catalog: str) -> list: ...
     def list_tables(self, catalog: str, schema: str) -> list: ...
     def describe_table_security(self, table: TableRef) -> TableSecurityState: ...
-    def show_policies(self, table: TableRef) -> list: ...
-    def describe_policy(self, table: TableRef, policy_name: str) -> Optional[PolicyDefinition]: ...
+    # `on_securable` is an already-backtick-quoted `ON` clause target, e.g.
+    # ``TABLE `cat`.`sch`.`tbl` `` or ``CATALOG `cat` `` - produced by
+    # `PolicyStrategy.on_securable_for()` (migration/policy_strategy.py),
+    # never built ad hoc by a caller. This is what lets these three methods
+    # serve both "table level application" and "catalog level application"
+    # (§7.3) without a signature change per scope.
+    def show_policies(self, on_securable: str) -> list: ...
+    def describe_policy(self, on_securable: str, policy_name: str) -> Optional[PolicyDefinition]: ...
     def function_exists(self, function_fqn: str) -> bool: ...
     def can_execute_function(self, function_fqn: str) -> bool: ...
     def create_or_replace_policy(self, spec: PolicySpec, dry_run: bool) -> PolicyApplyResult: ...
-    def drop_policy(self, table: TableRef, policy_name: str, dry_run: bool) -> None: ...
+    def drop_policy(self, on_securable: str, policy_name: str, dry_run: bool) -> None: ...
     def drop_row_filter(self, table: TableRef, dry_run: bool) -> None: ...
     def drop_column_mask(self, table: TableRef, column: str, dry_run: bool) -> None: ...
     def set_row_filter(self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool) -> None: ...
@@ -313,8 +319,8 @@ class DatabricksUnityCatalogGateway:
 
         return TableSecurityState(table=table, table_type=table_type, row_filter=row_filter, column_masks=column_masks)
 
-    def show_policies(self, table: TableRef) -> list:
-        res = self._execute(f"SHOW POLICIES ON TABLE {table.quoted_full_name}")
+    def show_policies(self, on_securable: str) -> list:
+        res = self._execute(f"SHOW POLICIES ON {on_securable}")
         refs = []
         for row in res.rows:
             row = list(row)
@@ -324,9 +330,9 @@ class DatabricksUnityCatalogGateway:
             ))
         return refs
 
-    def describe_policy(self, table: TableRef, policy_name: str) -> Optional[PolicyDefinition]:
+    def describe_policy(self, on_securable: str, policy_name: str) -> Optional[PolicyDefinition]:
         try:
-            res = self._execute(f"DESCRIBE POLICY {policy_name} ON TABLE {table.quoted_full_name}",
+            res = self._execute(f"DESCRIBE POLICY {policy_name} ON {on_securable}",
                                  treat_not_found_as="POLICY_NOT_FOUND")
         except UCGatewayError:
             raise
@@ -435,8 +441,8 @@ class DatabricksUnityCatalogGateway:
                 f"{using_clause}"
             )
 
-    def drop_policy(self, table: TableRef, policy_name: str, dry_run: bool) -> None:
-        statement = f"DROP POLICY {policy_name} ON TABLE {table.quoted_full_name}"
+    def drop_policy(self, on_securable: str, policy_name: str, dry_run: bool) -> None:
+        statement = f"DROP POLICY {policy_name} ON {on_securable}"
         if dry_run:
             return
         # No IF EXISTS in the grammar (§13) - explicitly swallow POLICY_NOT_FOUND
