@@ -135,3 +135,27 @@ targets:
       # abac_migration/spike/setup_target_phased_test.py, not every
       # catalog on the workspace.
       catalogs_json: '["ril_raw"]'
+
+  catalog_scope_test:
+    # Third, distinct workspace/metastore - authenticated via OAuth M2M
+    # service principal (client_id/client_secret in ~/.databrickscfg
+    # profile `ril_catalog_test`, not a PAT), used specifically to validate
+    # policy_scope=CATALOG ("catalog level application", DESIGN.md §7.3.1)
+    # stage by stage (INVENTORY -> APPLY_ABAC -> FINALIZE) against the
+    # dedicated `ril_catalog_scope_test` catalog created by
+    # abac_migration/spike/setup_ril_catalog_scope_test.py, where two
+    # legacy functions per schema deliberately guard 2 tables each - so a
+    # single CATALOG-scoped ABAC policy consolidating both tables is
+    # directly observable after Apply ABAC.
+    mode: production
+    workspace:
+      host: https://adb-7405616318078204.4.azuredatabricks.net
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      warehouse_id: "5fe1692f119e2528"
+      catalogs_json: '["ril_catalog_scope_test"]'
+      audit_catalog: "ril_catalog_scope_test"
+      audit_schema: "governance"
+      # The whole reason this target exists: exercise catalog level
+      # application end to end instead of the table-level default.
+      policy_scope: "CATALOG"
