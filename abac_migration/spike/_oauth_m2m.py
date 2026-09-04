@@ -1,4 +1,4 @@
-"""One-off helper for the `catalog_scope_test` target (OAuth M2M service
+"""One-off helper for the `catalog_scope` target (OAuth M2M service
 principal auth): mints a short-lived OAuth M2M (client_credentials) access
 token and writes it into ~/.databrickscfg as a *separate* token-based
 profile (`ril_catalog_test_pat`), because the two existing helper classes

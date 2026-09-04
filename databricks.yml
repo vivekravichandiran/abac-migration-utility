@@ -136,7 +136,7 @@ targets:
       # catalog on the workspace.
       catalogs_json: '["ril_raw"]'
 
-  catalog_scope_test:
+  catalog_scope:
     # Third, distinct workspace/metastore - authenticated via OAuth M2M
     # service principal (client_id/client_secret in ~/.databrickscfg
     # profile `ril_catalog_test`, not a PAT), used specifically to validate

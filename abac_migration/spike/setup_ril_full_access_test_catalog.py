@@ -1,5 +1,5 @@
-"""Second dedicated test catalog on the `catalog_scope_test` workspace
-(adb-7405616318078204), created on request specifically to be handed to
+"""Second dedicated test catalog on the `catalog_scope` bundle target's
+workspace (adb-7405616318078204), created on request specifically to be handed to
 `vivek.ravichandiran@databricks.com` with full access, while keeping the
 same RLS-only / mask-only / both structure as
 `setup_ril_catalog_scope_test.py` so it's immediately usable for the same
