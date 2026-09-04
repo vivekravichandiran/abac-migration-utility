@@ -153,8 +153,8 @@ targets:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     variables:
       warehouse_id: "5fe1692f119e2528"
-      catalogs_json: '["ril_catalog_scope_test"]'
-      audit_catalog: "ril_catalog_scope_test"
+      catalogs_json: '["ril_full_access_test"]'
+      audit_catalog: "ril_full_access_test"
       audit_schema: "governance"
       # The whole reason this target exists: exercise catalog level
       # application end to end instead of the table-level default.

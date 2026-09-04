@@ -40,7 +40,7 @@ resources:
               scope_type: "SELECTED_CATALOGS"
               catalogs: ${var.catalogs_json}
               exclude_schema_regex: "^information_schema$"
-              dry_run: "true"
+              dry_run: "false"
               continue_on_error: "true"
               max_parallelism: "4"
               audit_catalog: ${var.audit_catalog}
