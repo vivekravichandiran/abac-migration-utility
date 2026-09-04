@@ -18,7 +18,7 @@ subsequent idempotent rerun failed 100% of the time until this fix.
 from __future__ import annotations
 
 from ..uc_gateway.gateway import DatabricksUnityCatalogGateway
-from ..uc_gateway.models import TableRef
+from ..uc_gateway.models import MatchColumn, PolicySpec, TableRef
 
 
 class _StubExecutor:
@@ -65,3 +65,65 @@ def test_list_column_tags_preserves_a_genuinely_null_value():
     tags = gateway.list_column_tags(TableRef("cat", "sch", "employees"))
 
     assert tags[0].tag_value is None
+
+
+# -- EXCEPT principal(s) SQL generation ---------------------------------
+# Grammar confirmed via Databricks docs (CREATE POLICY, sql-ref-syntax-ddl-
+# create-policy): `TO principal [, ...] [ EXCEPT principal [, ...] ]`, for
+# both row_filter_body and column_mask_body. Not yet re-verified live
+# against this repo's own workspace (token expired mid-change) - the
+# examples in the docs (`TO 'All Users' EXCEPT 'HR admins'`) match the
+# clause shape built below exactly, though.
+
+def _row_filter_spec(except_principals):
+    mc = MatchColumn(tag_key="abac_rls_cat_sch_rf_dept", tag_value=None, alias="mc_department", source_column="department")
+    return PolicySpec(
+        policy_name="abac_migrated_row_filter", on_securable="TABLE `cat`.`sch`.`t1`",
+        policy_type="ROW_FILTER", function_fqn="cat.sch.rf_dept", match_columns=[mc],
+        using_columns=["mc_department"], to_principals=["account users"], except_principals=except_principals,
+    )
+
+
+def _column_mask_spec(except_principals):
+    mc = MatchColumn(tag_key="abac_colmask_cat_sch_mask_ssn", tag_value=None, alias="mc_ssn", source_column="ssn")
+    return PolicySpec(
+        policy_name="abac_migrated_mask_ssn", on_securable="TABLE `cat`.`sch`.`t1`",
+        policy_type="COLUMN_MASK", function_fqn="cat.sch.mask_ssn", match_columns=[mc],
+        using_columns=[], mask_target_alias="mc_ssn", to_principals=["account users"],
+        except_principals=except_principals,
+    )
+
+
+def test_build_create_policy_statement_omits_except_clause_when_empty():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+
+    stmt = gateway._build_create_policy_statement(_row_filter_spec([]))
+
+    assert "EXCEPT" not in stmt
+    assert "TO `account users`\n" in stmt  # unchanged from before this feature
+
+
+def test_build_create_policy_statement_adds_except_clause_for_row_filter():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+
+    stmt = gateway._build_create_policy_statement(_row_filter_spec(["etl_service_principal"]))
+
+    assert "TO `account users` EXCEPT `etl_service_principal`\n" in stmt
+
+
+def test_build_create_policy_statement_adds_except_clause_for_column_mask():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+
+    stmt = gateway._build_create_policy_statement(_column_mask_spec(["etl_service_principal"]))
+
+    assert "TO `account users` EXCEPT `etl_service_principal`\n" in stmt
+
+
+def test_build_create_policy_statement_multiple_except_principals():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+
+    stmt = gateway._build_create_policy_statement(
+        _row_filter_spec(["etl_service_principal", "break_glass_admins"])
+    )
+
+    assert "EXCEPT `etl_service_principal`, `break_glass_admins`\n" in stmt

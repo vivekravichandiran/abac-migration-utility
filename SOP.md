@@ -161,8 +161,9 @@ databricks bundle run <job_name> -t <target> --profile <your_profile> \
 > ⚠️ **Gotcha:** the CLI's `--notebook-params` flag parses its value as CSV,
 > so a JSON value containing double quotes (e.g. `schemas={"cat":["sch"]}`)
 > will fail to parse. For any parameter whose value is JSON (`catalogs`,
-> `schemas`, `tables`, `policy_to_principals`), use option **C** (REST API)
-> instead — it takes a normal JSON body with no such restriction.
+> `schemas`, `tables`, `policy_to_principals`, `policy_except_principals`),
+> use option **C** (REST API) instead — it takes a normal JSON body with no
+> such restriction.
 
 **C. REST API (most reliable for JSON-shaped parameters / scripting)**
 
@@ -644,6 +645,7 @@ Find its `run_id` in `migration_audit` → `ROLLBACK` with `dry_run=true`
 | `audit_table` / `inventory_table` | all | `migration_audit` / `inventory` | table names within `audit_schema` |
 | `policy_strategy` | mutating modes | `TABLE_BASED` | `TABLE_BASED` \| `FUNCTION_BASED` |
 | `policy_to_principals` | mutating modes | `["account users"]` | JSON list |
+| `policy_except_principals` | mutating modes | `[]` | JSON list of users/groups/service principals to **exempt** from every ABAC policy this run creates (`TO ... EXCEPT <principal>`) — e.g. `["etl_service_principal"]`. Exempted principals see fully unmasked/unfiltered data. Empty = no exemptions (unchanged behavior) |
 | `prefer_existing_tags` | mutating modes | `true` | reuse a compatible existing governed tag instead of minting a new one, if found |
 | `enable_llm_pii_tagging` | `INVENTORY` only | `false` | LLM-suggested PII category per legacy function — advisory only |
 | `pii_llm_endpoint` | `INVENTORY` only, when the above is `true` | `databricks-meta-llama-3-3-70b-instruct` | override if that model isn't enabled on your account |

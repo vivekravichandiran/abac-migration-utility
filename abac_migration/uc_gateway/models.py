@@ -99,6 +99,7 @@ class PolicyDefinition:
     function_fqn: str
     using_columns: list = field(default_factory=list)
     on_column_alias: Optional[str] = None
+    except_principals: list = field(default_factory=list)
 
 
 class PolicySpec(NamedTuple):
@@ -111,7 +112,21 @@ class PolicySpec(NamedTuple):
     match_columns: list  # list[MatchColumn]
     using_columns: list  # list[str] - aliases from match_columns, positional
     mask_target_alias: Optional[str] = None  # only for COLUMN_MASK
-    to_principals: list = field(default_factory=lambda: ["account users"])
+    # NamedTuple defaults are plain values, NOT dataclasses.field() - that
+    # was a latent bug here (fixed alongside adding except_principals below):
+    # `field(default_factory=...)` was never invoked, so an omitted
+    # to_principals silently defaulted to the unevaluated `Field` object
+    # itself. Harmless in practice since every real caller (policy_strategy.py)
+    # always passes it explicitly, but a plain list literal is the correct
+    # NamedTuple spelling - it's evaluated once at class-definition time and
+    # never mutated in place by any caller.
+    to_principals: list = ["account users"]
+    # `EXCEPT principal [, ...]` (confirmed live in the CREATE POLICY
+    # grammar): principals in this list are exempted from the row filter/
+    # column mask entirely - e.g. a service principal running unmasked ETL,
+    # or a break-glass admin group. Empty (default) omits the EXCEPT clause
+    # altogether, preserving today's behavior exactly.
+    except_principals: list = []
     comment: str = ""
 
 

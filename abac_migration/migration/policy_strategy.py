@@ -27,8 +27,14 @@ class TableBasedPolicyStrategy:
 
     ROW_FILTER_POLICY_NAME = "abac_migrated_row_filter"
 
-    def __init__(self, to_principals: Optional[list] = None):
+    def __init__(self, to_principals: Optional[list] = None, except_principals: Optional[list] = None):
         self.to_principals = to_principals or ["account users"]
+        # Principals fully exempted from every policy this strategy plans
+        # (`EXCEPT principal [, ...]`, confirmed live grammar) - e.g. a
+        # service principal that runs unmasked ETL, or a break-glass admin
+        # group. Empty by default, which omits the EXCEPT clause entirely
+        # and preserves prior behavior exactly.
+        self.except_principals = except_principals or []
 
     @classmethod
     def mask_policy_name(cls, column: str) -> str:
@@ -44,6 +50,7 @@ class TableBasedPolicyStrategy:
             using_columns=[mc.alias for mc in match_columns],
             mask_target_alias=None,
             to_principals=self.to_principals,
+            except_principals=self.except_principals,
             comment="Migrated from legacy table-level row filter by abac_migration utility.",
         )
 
@@ -64,6 +71,7 @@ class TableBasedPolicyStrategy:
             using_columns=[mc.alias for mc in extra],
             mask_target_alias=mask_match_column.alias,
             to_principals=self.to_principals,
+            except_principals=self.except_principals,
             comment=f"Migrated from legacy column mask on {column} by abac_migration utility.",
         )
 

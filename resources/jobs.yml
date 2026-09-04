@@ -16,6 +16,10 @@ resources:
         actually migrate a given scope. (Permission-denied and sample-table
         securables encountered under ALL_CATALOGS/ALL_SCHEMAS are still
         skipped gracefully rather than aborting the run, if you do use them.)
+        Override `policy_except_principals` (JSON array, default `[]`) to
+        exempt specific principals - e.g. a service principal running
+        unmasked ETL, or a break-glass admin group - from every ABAC policy
+        this run creates (`TO account users EXCEPT <principal>`).
       max_concurrent_runs: 1
       # Serverless job compute: the notebook only makes Python/requests
       # calls against the SQL Statement Execution API, so it needs no
@@ -37,6 +41,7 @@ resources:
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
               policy_strategy: "TABLE_BASED"
+              policy_except_principals: "[]"
               prefer_existing_tags: "true"
           environment_key: default
       environments:

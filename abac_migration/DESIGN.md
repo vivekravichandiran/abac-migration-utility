@@ -355,6 +355,7 @@ class PolicySpec(NamedTuple):
     using_columns: list[str]
     mask_target_column: str | None   # only for COLUMN_MASK
     to_principals: list[str]         # see §7.3 — default "account users"
+    except_principals: list[str]     # `TO ... EXCEPT ...` — default [] (no exemptions)
     comment: str
 ```
 
@@ -462,6 +463,18 @@ Revised strategy:
   security function" and "preserve existing security semantics" exactly.
   Empirically confirmed to produce identical effective results to the
   original table-level RLS/mask for the same querying identity (§17).
+- `EXCEPT principal [, ...]` is an optional, empty-by-default addition to
+  the same `TO` clause — the `CREATE POLICY` grammar supports it on both
+  `row_filter_body` and `column_mask_body`
+  (`TO principal [, ...] [EXCEPT principal [, ...]]`; docs example:
+  `TO 'All Users' EXCEPT 'HR admins'`). Configured via
+  `policy_except_principals` (RunConfig/job parameter, JSON array). Listed
+  principals are **fully exempt** — they see unfiltered/unmasked data,
+  regardless of what the underlying security function would otherwise
+  compute — the intended use case being a service principal that must run
+  unmasked ETL, or a break-glass admin group. Left empty, the `EXCEPT`
+  clause is omitted entirely and the generated SQL is byte-for-byte
+  unchanged from before this option existed.
 
 ### 7.4 Governed Tag Provisioning (new required sub-component: `migration/tag_provisioner.py`)
 
@@ -804,6 +817,7 @@ Rules:
 | `audit_catalog` / `audit_schema` / `audit_table` | str | none — required, no hard-coded default per-customer name | |
 | `policy_strategy` | str enum | `TABLE_BASED` | `TABLE_BASED`\|`FUNCTION_BASED` (§7.3) |
 | `policy_to_principals` | JSON array (str) | `["account users"]` | overridable if an org wants a narrower default `TO` clause |
+| `policy_except_principals` | JSON array (str) | `[]` | principals fully exempted (`TO ... EXCEPT principal [, ...]`, confirmed live CREATE POLICY grammar) from every ABAC policy this run creates - e.g. a service principal that runs unmasked ETL, or a break-glass admin group. Empty = no `EXCEPT` clause, unchanged prior behavior |
 | `enable_llm_pii_tagging` | bool | `false` | `INVENTORY`-only, advisory: classify each legacy function's likely PII category via `ai_query()` from its name+columns alone (never row data) |
 | `pii_llm_endpoint` | str | `databricks-meta-llama-3-3-70b-instruct` | Foundation Model API endpoint used by `enable_llm_pii_tagging` |
 | `run_id` | str | generated UUID if blank | allows resuming/correlating a specific run, e.g. for `ROLLBACK` mode targeting one prior run |

@@ -49,7 +49,10 @@ resources:
         never a security gap (strictly additive). Recorded in
         migration_audit with migration_phase=ABAC_APPLIED (explicitly not
         final). Run "ABAC Migration - 3. Finalize" once you've reviewed/
-        confirmed the new policies look correct.
+        confirmed the new policies look correct. Override
+        `policy_except_principals` (JSON array, default `[]`) to exempt
+        specific principals - e.g. a service principal running unmasked
+        ETL - from every ABAC policy this run creates.
       max_concurrent_runs: 1
       tasks:
         - task_key: run_apply_abac
@@ -67,6 +70,7 @@ resources:
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
               policy_strategy: "TABLE_BASED"
+              policy_except_principals: "[]"
               prefer_existing_tags: "true"
           environment_key: default
       environments:

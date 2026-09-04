@@ -352,6 +352,15 @@ class DatabricksUnityCatalogGateway:
             function_fqn=kv.get("  Function Name") or kv.get("Function Name") or "",
             using_columns=[c.strip() for c in (kv.get("  Using Columns") or "").split(",") if c.strip()],
             on_column_alias=kv.get("  On Column") or None,
+            # NOTE: key name inferred from the consistent "To Principals" /
+            # "Match Columns" / etc. naming convention seen in every other
+            # DESCRIBE POLICY field, NOT yet confirmed-live like the rest of
+            # this file's parsing (§17 methodology) - the workspace token
+            # available while adding this expired before it could be. Kept
+            # a soft .get() (degrades to [] rather than raising) specifically
+            # because of that; re-verify against a live DESCRIBE POLICY ...
+            # EXCEPT output and correct the key here if it differs.
+            except_principals=[p.strip() for p in (kv.get("Except Principals") or "").split(",") if p.strip()],
         )
 
     def function_exists(self, function_fqn: str) -> bool:
@@ -392,6 +401,13 @@ class DatabricksUnityCatalogGateway:
         )
         principals = ", ".join(f"`{p}`" for p in spec.to_principals)
         comment_clause = f"COMMENT '{spec.comment}'\n" if spec.comment else ""
+        # `EXCEPT principal [, ...]` (confirmed live grammar): principals
+        # here are fully exempted - not subject to the row filter/column
+        # mask at all, see full unmasked/unfiltered data. Omitted entirely
+        # when empty (the default), identical to today's statement text.
+        except_clause = (
+            f" EXCEPT {', '.join(f'`{p}`' for p in spec.except_principals)}" if spec.except_principals else ""
+        )
 
         if spec.policy_type == "ROW_FILTER":
             using_clause = f"\nUSING COLUMNS ({', '.join(spec.using_columns)})" if spec.using_columns else ""
@@ -400,7 +416,7 @@ class DatabricksUnityCatalogGateway:
                 f"ON {spec.on_securable}\n"
                 f"{comment_clause}"
                 f"ROW FILTER {spec.function_fqn}\n"
-                f"TO {principals}\n"
+                f"TO {principals}{except_clause}\n"
                 f"FOR TABLES\n"
                 f"MATCH COLUMNS {match_clauses}"
                 f"{using_clause}"
@@ -412,7 +428,7 @@ class DatabricksUnityCatalogGateway:
                 f"ON {spec.on_securable}\n"
                 f"{comment_clause}"
                 f"COLUMN MASK {spec.function_fqn}\n"
-                f"TO {principals}\n"
+                f"TO {principals}{except_clause}\n"
                 f"FOR TABLES\n"
                 f"MATCH COLUMNS {match_clauses}\n"
                 f"ON COLUMN {spec.mask_target_alias}"

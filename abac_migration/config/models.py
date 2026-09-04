@@ -46,6 +46,7 @@ class PolicyStrategyType(str, Enum):
 
 
 DEFAULT_POLICY_TO_PRINCIPALS = ["account users"]
+DEFAULT_POLICY_EXCEPT_PRINCIPALS: list = []
 
 # A pay-per-token Foundation Model API endpoint, invoked via the `ai_query()`
 # SQL function directly from the SQL Statement Execution API client - no
@@ -84,6 +85,11 @@ class RunConfig:
 
     policy_strategy: PolicyStrategyType = PolicyStrategyType.TABLE_BASED
     policy_to_principals: list = field(default_factory=lambda: list(DEFAULT_POLICY_TO_PRINCIPALS))
+    # Principals (users/groups/service principals) fully exempted from every
+    # ABAC policy this run creates (`EXCEPT principal [, ...]`, confirmed
+    # live grammar - e.g. a service principal running unmasked ETL). Empty
+    # by default: no EXCEPT clause is added, identical to prior behavior.
+    policy_except_principals: list = field(default_factory=lambda: list(DEFAULT_POLICY_EXCEPT_PRINCIPALS))
     prefer_existing_tags: bool = True
 
     # INVENTORY-only: best-effort LLM classification of each legacy row-filter
@@ -161,6 +167,9 @@ class RunConfig:
         data["tables"] = _maybe_json(data.get("tables"), [])
         data["policy_to_principals"] = _maybe_json(
             data.get("policy_to_principals"), list(DEFAULT_POLICY_TO_PRINCIPALS)
+        )
+        data["policy_except_principals"] = _maybe_json(
+            data.get("policy_except_principals"), list(DEFAULT_POLICY_EXCEPT_PRINCIPALS)
         )
 
         if "mode" in data and not isinstance(data["mode"], Mode):

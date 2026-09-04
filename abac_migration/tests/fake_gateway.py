@@ -178,6 +178,7 @@ class FakeUnityCatalogGateway:
             name=spec.policy_name, policy_type=spec.policy_type, on_securable_type="TABLE", on_securable=table_fqn,
             to_principals=list(spec.to_principals), match_columns=[mc.alias for mc in spec.match_columns],
             function_fqn=spec.function_fqn, using_columns=list(spec.using_columns), on_column_alias=spec.mask_target_alias,
+            except_principals=list(spec.except_principals),
         )
         self.policies.setdefault(table_fqn, {})[spec.policy_name] = policy_def
         return PolicyApplyResult(success=True, policy_name=spec.policy_name, statement_text="-- fake --")

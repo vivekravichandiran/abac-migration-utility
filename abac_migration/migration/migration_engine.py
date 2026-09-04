@@ -61,7 +61,9 @@ def run(config: RunConfig, uc: UnityCatalogGateway) -> RunSummary:
     audit_repo.ensure_tables_exist(dry_run=config.dry_run)
     inventory_repo = InventoryRepository(uc, config.inventory_table_fqn)
 
-    strategy: PolicyStrategy = TableBasedPolicyStrategy(to_principals=config.policy_to_principals)
+    strategy: PolicyStrategy = TableBasedPolicyStrategy(
+        to_principals=config.policy_to_principals, except_principals=config.policy_except_principals,
+    )
 
     if config.mode == Mode.ROLLBACK:
         summary.other_results = _run_rollback(config, uc, audit_repo, strategy)
