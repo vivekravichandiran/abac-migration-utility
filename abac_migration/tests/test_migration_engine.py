@@ -181,3 +181,62 @@ def test_catalog_scope_finalize_mode_removes_legacy_for_all_tables():
         assert fake.row_filters[f"cat.sch.t{i}"] is None
     tag_key = tag_key_for_function(RF_FN, "row_filter")
     assert tag_key in fake.policies["cat"]  # shared policy still lives on
+
+
+# ---------------------------------------------------------------------------
+# tag_team_prefix (§7.4): namespaces every governed tag key this run mints
+# and, under policy_scope=CATALOG, every policy name too - end to end
+# through the real engine (build_policy_strategy -> TagProvisioner ->
+# plugins -> table_converter), not just the isolated unit tests in
+# test_tag_provisioner.py / test_policy_strategy.py.
+# ---------------------------------------------------------------------------
+
+def test_apply_abac_with_team_prefix_mints_namespaced_governed_tag_table_scope():
+    fake = _fake_with_n_tables(1)
+
+    summary = run(_config(mode=Mode.APPLY_ABAC, tag_team_prefix="mobility"), fake)
+
+    assert summary.tables_abac_applied == 1
+    expected_tag_key = tag_key_for_function(RF_FN, "row_filter", "mobility")
+    assert expected_tag_key in fake.governed_tags
+    # TABLE scope's policy name is ALSO namespaced now (not just the tag key).
+    assert "abac_mobility_migrated_row_filter" in fake.policies["cat.sch.t0"]
+
+
+def test_apply_abac_with_team_prefix_catalog_scope_shares_one_namespaced_policy():
+    fake = _fake_with_n_tables(3)
+
+    summary = run(_config(mode=Mode.APPLY_ABAC, policy_scope=PolicyScope.CATALOG, tag_team_prefix="mobility"), fake)
+
+    assert summary.tables_abac_applied == 3
+    expected_key = tag_key_for_function(RF_FN, "row_filter", "mobility")
+    assert len(fake.policies.get("cat", {})) == 1
+    assert expected_key in fake.policies["cat"]
+    # The no-prefix key/policy name must never have been created.
+    assert tag_key_for_function(RF_FN, "row_filter") not in fake.policies["cat"]
+
+
+def test_finalize_after_apply_abac_with_team_prefix_still_finds_and_removes_legacy():
+    fake = _fake_with_n_tables(2)
+    run(_config(mode=Mode.APPLY_ABAC, tag_team_prefix="mobility"), fake)
+
+    summary = run(_config(mode=Mode.FINALIZE, run_id="finalize-run", tag_team_prefix="mobility"), fake)
+
+    assert summary.tables_succeeded == 2
+    for i in range(2):
+        assert fake.row_filters[f"cat.sch.t{i}"] is None
+    assert "abac_mobility_migrated_row_filter" in fake.policies["cat.sch.t0"]
+
+
+def test_finalize_with_mismatched_team_prefix_never_finds_the_policy():
+    # Explicit documentation-backed contract (job description, DESIGN.md):
+    # tag_team_prefix must be identical across Apply-ABAC -> Finalize. A
+    # mismatch must be a safe no-op (NOT_ELIGIBLE), never a false SUCCESS
+    # and never a crash.
+    fake = _fake_with_n_tables(1)
+    run(_config(mode=Mode.APPLY_ABAC, tag_team_prefix="mobility"), fake)
+
+    summary = run(_config(mode=Mode.FINALIZE, run_id="finalize-run", tag_team_prefix="payments"), fake)
+
+    assert summary.tables_succeeded == 0
+    assert fake.row_filters["cat.sch.t0"] is not None  # legacy untouched - never removed

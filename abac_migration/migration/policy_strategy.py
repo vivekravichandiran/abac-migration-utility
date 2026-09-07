@@ -16,14 +16,22 @@ Two concrete implementations, selected by `RunConfig.policy_scope`
 1:1 to the two supported end-to-end workflows requested for this tool:
 
 - **"Table level application"** (`TableBasedPolicyStrategy`, the pre-
-  existing/default behavior, unchanged): one ROW_FILTER policy `ON TABLE`
-  per table, one COLUMN_MASK policy `ON TABLE` per masked column. Steps:
+  existing/default behavior): one ROW_FILTER policy `ON TABLE` per table,
+  one COLUMN_MASK policy `ON TABLE` per masked column. Steps:
   1) identify legacy row filters/column masks, 2) create one governed tag
   per legacy function, 3) tag the governed column(s), 4) `CREATE POLICY
   ... ON TABLE <table>`, 5) manual-review resting state with BOTH the
   legacy mechanism and the new ABAC policy live (`Mode.APPLY_ABAC`), 6)
   remove the legacy mechanism (`Mode.FINALIZE`). No code changes were
-  needed for this mode - it already implemented exactly this flow.
+  needed for this mode when CatalogBasedPolicyStrategy was added - it
+  already implemented exactly this flow. `RunConfig.tag_team_prefix` DOES
+  affect this mode's own policy names too (not just its governed tag keys):
+  the previously-constant `abac_migrated_row_filter` /
+  `abac_migrated_mask_<column>` become
+  `abac_<team_prefix>_migrated_row_filter` /
+  `abac_<team_prefix>_migrated_mask_<column>` whenever a non-empty
+  team_prefix is configured, so every object (tag AND policy) one team's
+  run creates is consistently namespaced, regardless of policy_scope.
 - **"Catalog level application"** (`CatalogBasedPolicyStrategy`, new): steps
   1-3 identical (still one governed tag per legacy function, still applied
   directly to the governed table's own column(s) - tagging is scope-
@@ -44,7 +52,7 @@ from typing import NamedTuple, Optional, Protocol
 
 from ..uc_gateway.gateway import UnityCatalogGateway
 from ..uc_gateway.models import MatchColumn, PolicyDefinition, PolicySpec, TableRef, quote_ident
-from .tag_provisioner import tag_key_for_function
+from .tag_provisioner import sanitize_name_part, tag_key_for_function
 
 # Governed-tag-key prefixes (tag_provisioner.py's `tag_key_for_function`) -
 # used by CatalogBasedPolicyStrategy to recognize "this column already
@@ -67,6 +75,7 @@ class ExistingMaskPolicy(NamedTuple):
 class PolicyStrategy(Protocol):
     to_principals: list
     except_principals: list
+    team_prefix: str
 
     def on_securable_for(self, table: TableRef) -> str:
         """The `ON <securable>` clause (already backtick-quoted, e.g.
@@ -119,16 +128,30 @@ class PolicyStrategy(Protocol):
 
 
 class TableBasedPolicyStrategy:
-    """"Table level application" (§7.3, default, unchanged from before
-    CatalogBasedPolicyStrategy existed): one ROW_FILTER policy per table,
-    one COLUMN_MASK policy per masked column, all `ON TABLE`-scoped. Policy
-    names are securable-scoped (confirmed §17) so no cross-table collision
-    risk from using the same deterministic names everywhere."""
+    """"Table level application" (§7.3, default): one ROW_FILTER policy per
+    table, one COLUMN_MASK policy per masked column, all `ON TABLE`-scoped.
+    Policy names are securable-scoped (confirmed §17) so no cross-table
+    collision risk from using the same deterministic names everywhere.
+
+    `ROW_FILTER_POLICY_NAME`/`MASK_POLICY_PREFIX` are the original,
+    still-in-effect-when-team_prefix-is-empty literal constants (kept as-is,
+    unrenamed, for backward compatibility with anything referencing them
+    directly, e.g. tests). When a non-empty `team_prefix` is configured,
+    `_row_filter_policy_name_str()`/`_mask_policy_prefix_str()` instead
+    namespace them: `abac_migrated_row_filter` ->
+    `abac_<team_prefix>_migrated_row_filter`, `abac_migrated_mask_` ->
+    `abac_<team_prefix>_migrated_mask_` (see module docstring) - sanitized
+    via the same `sanitize_name_part()` tag_provisioner.py's
+    tag_key_for_function uses, so one raw team_prefix value always produces
+    one identical sanitized segment everywhere it's used across this tool."""
 
     ROW_FILTER_POLICY_NAME = "abac_migrated_row_filter"
     MASK_POLICY_PREFIX = "abac_migrated_mask_"
 
-    def __init__(self, to_principals: Optional[list] = None, except_principals: Optional[list] = None):
+    def __init__(
+        self, to_principals: Optional[list] = None, except_principals: Optional[list] = None,
+        team_prefix: str = "",
+    ):
         self.to_principals = to_principals or ["account users"]
         # Principals fully exempted from every policy this strategy plans
         # (`EXCEPT principal [, ...]`, confirmed live grammar) - e.g. a
@@ -136,29 +159,45 @@ class TableBasedPolicyStrategy:
         # group. Empty by default, which omits the EXCEPT clause entirely
         # and preserves prior behavior exactly.
         self.except_principals = except_principals or []
+        # Namespaces this strategy's own policy names too now (not just the
+        # governed TAG keys TagProvisioner mints, which is shared/
+        # independent of policy_scope, see tag_provisioner.py) - see
+        # _row_filter_policy_name_str()/_mask_policy_prefix_str() below.
+        self.team_prefix = team_prefix
 
     def on_securable_for(self, table: TableRef) -> str:
         return f"TABLE {table.quoted_full_name}"
 
+    def _row_filter_policy_name_str(self) -> str:
+        if not self.team_prefix:
+            return self.ROW_FILTER_POLICY_NAME
+        return f"abac_{sanitize_name_part(self.team_prefix)}_migrated_row_filter"
+
+    def _mask_policy_prefix_str(self) -> str:
+        if not self.team_prefix:
+            return self.MASK_POLICY_PREFIX
+        return f"abac_{sanitize_name_part(self.team_prefix)}_migrated_mask_"
+
     def row_filter_policy_name(self, function_fqn: str) -> str:
         del function_fqn  # constant regardless of function - see class docstring
-        return self.ROW_FILTER_POLICY_NAME
+        return self._row_filter_policy_name_str()
 
     def mask_policy_name(self, column: str, function_fqn: str = "") -> str:
         del function_fqn  # ignored - keyed purely on column, see class docstring
-        return f"{self.MASK_POLICY_PREFIX}{column}"
+        return f"{self._mask_policy_prefix_str()}{column}"
 
     def find_existing_row_filter_policy(self, table: TableRef, uc: UnityCatalogGateway) -> Optional[PolicyDefinition]:
-        return uc.describe_policy(self.on_securable_for(table), self.ROW_FILTER_POLICY_NAME)
+        return uc.describe_policy(self.on_securable_for(table), self._row_filter_policy_name_str())
 
     def find_existing_mask_policies(self, table: TableRef, uc: UnityCatalogGateway) -> list:
         on_securable = self.on_securable_for(table)
+        mask_prefix = self._mask_policy_prefix_str()
         found = []
         for ref in uc.show_policies(on_securable):
-            if ref.policy_type == "COLUMN_MASK" and ref.policy_name.startswith(self.MASK_POLICY_PREFIX):
+            if ref.policy_type == "COLUMN_MASK" and ref.policy_name.startswith(mask_prefix):
                 policy_def = uc.describe_policy(on_securable, ref.policy_name)
                 if policy_def is not None:
-                    column = ref.policy_name[len(self.MASK_POLICY_PREFIX):]
+                    column = ref.policy_name[len(mask_prefix):]
                     found.append(ExistingMaskPolicy(column=column, policy_def=policy_def))
         return found
 
@@ -233,19 +272,51 @@ class CatalogBasedPolicyStrategy:
     per-table-independent/parallelizable (§2) today.
     """
 
-    def __init__(self, to_principals: Optional[list] = None, except_principals: Optional[list] = None):
+    def __init__(
+        self, to_principals: Optional[list] = None, except_principals: Optional[list] = None,
+        team_prefix: str = "",
+    ):
         self.to_principals = to_principals or ["account users"]
         self.except_principals = except_principals or []
+        # Must be the same value tag_provisioner.py's TagProvisioner was
+        # constructed with for this run (both come from
+        # RunConfig.tag_team_prefix via migration_engine.build_policy_strategy
+        # / _run_migration) - this is what keeps the CATALOG-scoped policy
+        # name identical to the governed tag key it reuses (class docstring).
+        self.team_prefix = team_prefix
 
     def on_securable_for(self, table: TableRef) -> str:
         return f"CATALOG {quote_ident(table.catalog)}"
 
     def row_filter_policy_name(self, function_fqn: str) -> str:
-        return tag_key_for_function(function_fqn, "row_filter")
+        return tag_key_for_function(function_fqn, "row_filter", self.team_prefix)
 
     def mask_policy_name(self, column: str, function_fqn: str) -> str:
         del column  # deliberately ignored - keyed purely on function, see class docstring
-        return tag_key_for_function(function_fqn, "mask")
+        return tag_key_for_function(function_fqn, "mask", self.team_prefix)
+
+    def _tag_prefix_for_table(self, role_prefix: str, table: TableRef) -> str:
+        """Reconstructs the deterministic, (team_prefix, catalog, schema)-
+        scoped PREFIX `tag_key_for_function()` would produce for ANY
+        function in this table's own catalog/schema under THIS strategy's
+        `team_prefix` - everything up to (but not including) the final
+        `<function_name>` segment, which this recovery path doesn't know
+        yet (that's the whole point of it - see docstring below). Used to
+        filter `list_column_tags()` candidates precisely (REVISED - was
+        `tag.tag_key.startswith(_RLS_TAG_PREFIX)`, the bare role prefix
+        with no team/catalog/schema scoping at all): confirmed live, a
+        `team_prefix="mobility"` run's discovery must never match a
+        DIFFERENT team's (or a no-prefix run's) leftover column tag merely
+        because it also starts with `abac_rls_` - the #1 practical failure
+        mode the bare-prefix check had. A no-prefix run's discovery is
+        still not perfectly immune to matching a *different* team's
+        prefixed tag whose sanitized team segment happens to collide with
+        this catalog/schema's own sanitized name, but requiring the full
+        catalog+schema match (not just the role prefix) makes that
+        vanishingly unlikely in practice, and is the most precise filter
+        possible without already knowing the function name."""
+        parts = [self.team_prefix, table.catalog, table.schema] if self.team_prefix else [table.catalog, table.schema]
+        return role_prefix + "_".join(sanitize_name_part(p) for p in parts if p) + "_"
 
     def find_existing_row_filter_policy(self, table: TableRef, uc: UnityCatalogGateway) -> Optional[PolicyDefinition]:
         """Legacy row filter (if any) already tells us the function up
@@ -256,8 +327,9 @@ class CatalogBasedPolicyStrategy:
         govern this table", since the tag KEY itself deterministically
         encodes catalog+schema+function_name (tag_provisioner.py)."""
         on_securable = self.on_securable_for(table)
+        prefix = self._tag_prefix_for_table(_RLS_TAG_PREFIX, table)
         for tag in uc.list_column_tags(table):
-            if tag.tag_key.startswith(_RLS_TAG_PREFIX):
+            if tag.tag_key.startswith(prefix):
                 policy_def = uc.describe_policy(on_securable, tag.tag_key)
                 if policy_def is not None:
                     return policy_def
@@ -265,10 +337,11 @@ class CatalogBasedPolicyStrategy:
 
     def find_existing_mask_policies(self, table: TableRef, uc: UnityCatalogGateway) -> list:
         on_securable = self.on_securable_for(table)
+        prefix = self._tag_prefix_for_table(_MASK_TAG_PREFIX, table)
         found = []
         policy_def_cache: dict = {}
         for tag in uc.list_column_tags(table):
-            if not tag.tag_key.startswith(_MASK_TAG_PREFIX):
+            if not tag.tag_key.startswith(prefix):
                 continue
             if tag.tag_key not in policy_def_cache:
                 policy_def_cache[tag.tag_key] = uc.describe_policy(on_securable, tag.tag_key)

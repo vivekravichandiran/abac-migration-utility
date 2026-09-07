@@ -18,25 +18,37 @@ legacy function guards more than one column of the same table (rare, but
 real - e.g. a generic reusable mask function applied to two columns).
 
 Tag KEY granularity: one governed tag key per distinct legacy SQL function,
-named `abac_<rls|colmask>_<catalog>_<schema>_<function_name>` - e.g.
-`cat.sch.rf_region_both` -> `abac_rls_cat_sch_rf_region_both`. Including the
-full catalog.schema qualification (not just the function's own short name)
-makes the key deterministically unique with NO hash/digest suffix ever
-needed: two different functions can only produce the same key if they are
-the exact same catalog.schema.function_name to begin with. Each of
-catalog/schema/function-name is sanitized independently (any character
-outside `[A-Za-z0-9_]` - including hyphens, a confirmed-live real case, see
-`quote_ident()`'s docstring re: catalog `jh-demo` - is replaced with `_`)
-before being joined. Not one shared key for "all row filters" / "all column
-masks" account-wide either - this keeps each function's migrated columns
-independently discoverable/auditable by tag key (`SHOW GOVERNED TAGS` /
-`DESCRIBE GOVERNED TAG abac_rls_<cat>_<sch>_<fn>` maps 1:1 back to the
-legacy function that used to enforce that security), at the cost of many
-more tag keys for a large migration - a deliberate trade requested over
-both the original 2-keys-for-everything design AND a later short-name-only
-variant (which needed hash-suffix disambiguation whenever two different
-functions in different schemas happened to share a short name - dropped
-entirely now that the key is fully qualified).
+named `abac_<rls|colmask>_[<team_prefix>_]<catalog>_<schema>_<function_name>`
+- e.g. `cat.sch.rf_region_both` -> `abac_rls_cat_sch_rf_region_both` (no
+team prefix configured, the default), or `abac_rls_mobility_cat_sch_rf_region_both`
+when `RunConfig.tag_team_prefix="mobility"` (config/models.py, wired through
+from the `tag_team_prefix` YAML/job variable - see databricks.yml). The
+optional team prefix is meant to namespace every governed tag this tool
+creates by the owning team when multiple teams/business units run this
+utility against the same metastore, so `SHOW GOVERNED TAGS LIKE
+'abac_%_mobility_%'` (or a simple prefix filter) can scope discovery/
+auditing/cleanup to just one team's migrated tags. It is sanitized exactly
+like catalog/schema/function-name below (any character outside
+`[A-Za-z0-9_]` replaced with `_`) and simply omitted from the key entirely
+when empty (the default) - zero behavior change for anyone not using it.
+Including the full catalog.schema qualification (not just the function's
+own short name) makes the key deterministically unique with NO hash/digest
+suffix ever needed: two different functions can only produce the same key
+if they are the exact same catalog.schema.function_name (and team_prefix)
+to begin with. Each of team_prefix/catalog/schema/function-name is
+sanitized independently (any character outside `[A-Za-z0-9_]` - including
+hyphens, a confirmed-live real case, see `quote_ident()`'s docstring re:
+catalog `jh-demo` - is replaced with `_`) before being joined. Not one
+shared key for "all row filters" / "all column masks" account-wide either -
+this keeps each function's migrated columns independently discoverable/
+auditable by tag key (`SHOW GOVERNED TAGS` / `DESCRIBE GOVERNED TAG
+abac_rls_<cat>_<sch>_<fn>` maps 1:1 back to the legacy function that used
+to enforce that security), at the cost of many more tag keys for a large
+migration - a deliberate trade requested over both the original
+2-keys-for-everything design AND a later short-name-only variant (which
+needed hash-suffix disambiguation whenever two different functions in
+different schemas happened to share a short name - dropped entirely now
+that the key is fully qualified).
 
 `_mint_and_assign()` still guards against the one remaining, extremely
 unlikely edge case: sanitization collapsing two genuinely different raw
@@ -135,18 +147,39 @@ def _short_function_name(function_fqn: str) -> str:
     return _fqn_parts(function_fqn)[-1]
 
 
-def _sanitize(part: str) -> str:
+def sanitize_name_part(part: str) -> str:
+    """Replaces every character outside `[A-Za-z0-9_]` (including hyphens,
+    a confirmed-live real case - see `quote_ident()`'s docstring re:
+    catalog `jh-demo`) with `_`. Public (no leading underscore): shared by
+    `tag_key_for_function` below AND by `policy_strategy.py`'s
+    `TableBasedPolicyStrategy` (§7.3), which now also folds a sanitized
+    `team_prefix` into its own (previously constant) ROW_FILTER/COLUMN_MASK
+    policy names - both call sites need byte-for-byte identical sanitization
+    so the same raw team_prefix always produces the same sanitized segment
+    everywhere it's used."""
     return re.sub(r"[^a-zA-Z0-9_]", "_", part)
 
 
-def tag_key_for_function(function_fqn: str, role: Literal["row_filter", "mask"]) -> str:
-    """One governed tag KEY per (catalog, schema, function, role):
-    `abac_<rls|colmask>_<catalog>_<schema>_<function_name>`, each component
-    independently sanitized (non `[A-Za-z0-9_]` characters, including
-    hyphens, replaced with `_`) - e.g. `jh-demo.some_schema.rf_region_both`
-    -> `abac_rls_jh_demo_some_schema_rf_region_both`. Deterministic and
-    stable across runs/tables for the same function_fqn; no hash/digest is
-    ever appended (see module docstring).
+# Backward-compatible private alias - every call site in this module already
+# used the leading-underscore name before it was made public for reuse.
+_sanitize = sanitize_name_part
+
+
+def tag_key_for_function(
+    function_fqn: str, role: Literal["row_filter", "mask"], team_prefix: str = "",
+) -> str:
+    """One governed tag KEY per (team_prefix, catalog, schema, function,
+    role): `abac_<rls|colmask>_[<team_prefix>_]<catalog>_<schema>_<function_name>`,
+    each component independently sanitized (non `[A-Za-z0-9_]` characters,
+    including hyphens, replaced with `_`) - e.g.
+    `jh-demo.some_schema.rf_region_both` with no team_prefix ->
+    `abac_rls_jh_demo_some_schema_rf_region_both`; the same function with
+    `team_prefix="mobility"` -> `abac_rls_mobility_jh_demo_some_schema_rf_region_both`.
+    `team_prefix` is entirely omitted (not even an empty segment) when
+    falsy/empty (the default) - identical output to before this parameter
+    existed. Deterministic and stable across runs/tables for the same
+    (team_prefix, function_fqn, role); no hash/digest is ever appended (see
+    module docstring).
 
     Public (no leading underscore): also reused verbatim by
     `CatalogBasedPolicyStrategy` (policy_strategy.py) as the CATALOG-scoped
@@ -154,10 +187,15 @@ def tag_key_for_function(function_fqn: str, role: Literal["row_filter", "mask"])
     GOVERNED TAG` are distinct object kinds with separate namespaces, so
     reusing the identical deterministic string for both gives free 1:1
     traceability (one migrated function <-> one name, everywhere) instead
-    of inventing a second parallel naming scheme."""
+    of inventing a second parallel naming scheme. Whatever `team_prefix` a
+    run uses must stay the same across Inventory -> Apply-ABAC -> Finalize
+    for that migration, same rule as `policy_scope` - changing it mid-
+    pipeline makes this function compute a *different* key/policy name and
+    breaks idempotent-rerun/existing-policy recovery."""
     role_abbrev = "rls" if role == "row_filter" else "colmask"
     catalog, schema, func_name = _fqn_parts(function_fqn)
-    sanitized = "_".join(_sanitize(part) for part in (catalog, schema, func_name) if part)
+    parts = [team_prefix, catalog, schema, func_name] if team_prefix else [catalog, schema, func_name]
+    sanitized = "_".join(_sanitize(part) for part in parts if part)
     if len(sanitized) > _MAX_SANITIZED_NAME_LEN:
         sanitized = sanitized[:_MAX_SANITIZED_NAME_LEN]
     return f"abac_{role_abbrev}_{sanitized}"
@@ -176,9 +214,15 @@ def _synthetic_value_for(request: TagRequest) -> str:
 
 
 class TagProvisioner:
-    def __init__(self, uc: UnityCatalogGateway, prefer_existing_tags: bool = True):
+    def __init__(self, uc: UnityCatalogGateway, prefer_existing_tags: bool = True, team_prefix: str = ""):
         self._uc = uc
         self._prefer_existing_tags = prefer_existing_tags
+        # Threaded into every tag_key_for_function() call below when minting
+        # a NEW tag (see that function's docstring / RunConfig.tag_team_prefix)
+        # - never affects reuse of an already-existing tag (_find_reusable_tag
+        # matches on whatever key is already assigned to the column, whatever
+        # prefix it was minted with).
+        self._team_prefix = team_prefix
 
     def prepare(self, requests: list, dry_run: bool = False) -> dict:
         """Resolves every TagRequest to a MatchColumn, minting/growing
@@ -243,7 +287,7 @@ class TagProvisioner:
         by_key: dict = {}
         key_owner_fqn: dict = {}
         for req in to_mint:
-            tag_key = tag_key_for_function(req.function_fqn, req.role)
+            tag_key = tag_key_for_function(req.function_fqn, req.role, self._team_prefix)
             owner_fqn = key_owner_fqn.setdefault(tag_key, req.function_fqn)
             if owner_fqn != req.function_fqn:
                 raise TagKeyCollisionError(

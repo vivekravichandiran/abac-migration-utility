@@ -23,6 +23,7 @@ WIDGET_NAMES = [
     "policy_scope",
     "policy_to_principals",
     "policy_except_principals",
+    "tag_team_prefix",
     "prefer_existing_tags",
     "enable_llm_pii_tagging",
     "pii_llm_endpoint",
@@ -48,6 +49,10 @@ WIDGET_DEFAULTS = {
     "policy_scope": "TABLE",
     "policy_to_principals": '["account users"]',
     "policy_except_principals": "[]",
+    # Optional namespace segment, e.g. "mobility" -> governed tag keys named
+    # abac_rls_mobility_<cat>_<sch>_<fn> instead of abac_rls_<cat>_<sch>_<fn>
+    # - see config/models.py RunConfig.tag_team_prefix / DESIGN.md §7.4.
+    "tag_team_prefix": "",
     "prefer_existing_tags": "true",
     "enable_llm_pii_tagging": "false",
     "pii_llm_endpoint": DEFAULT_PII_LLM_ENDPOINT,

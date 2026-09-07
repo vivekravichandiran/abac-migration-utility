@@ -24,7 +24,11 @@ resources:
         application", default - one ABAC policy per table/masked column)
         and `CATALOG` ("catalog level application" - one ABAC policy per
         legacy function, `ON CATALOG`, shared by every table it used to
-        govern).
+        govern). Override `tag_team_prefix` (default empty) to namespace
+        every governed tag key (and, under `policy_scope=CATALOG`, every
+        policy name) this run mints, e.g. "mobility" ->
+        `abac_colmask_mobility_<catalog>_<schema>_<function>` instead of
+        `abac_colmask_<catalog>_<schema>_<function>`.
       max_concurrent_runs: 1
       # Serverless job compute: the notebook only makes Python/requests
       # calls against the SQL Statement Execution API, so it needs no
@@ -47,6 +51,7 @@ resources:
               audit_schema: ${var.audit_schema}
               policy_scope: ${var.policy_scope}
               policy_except_principals: ${var.policy_except_principals}
+              tag_team_prefix: ${var.tag_team_prefix}
               prefer_existing_tags: "true"
           environment_key: default
       environments:

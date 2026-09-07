@@ -60,6 +60,12 @@ class PolicyScope(str, Enum):
 
 DEFAULT_POLICY_TO_PRINCIPALS = ["account users"]
 DEFAULT_POLICY_EXCEPT_PRINCIPALS: list = []
+# Optional namespace segment inserted into every governed tag KEY this run
+# mints (tag_provisioner.py tag_key_for_function) - and, under
+# PolicyScope.CATALOG, into every ABAC policy name too, since
+# CatalogBasedPolicyStrategy reuses the tag key verbatim as its policy name.
+# Empty by default: omitted from the key entirely (no behavior change).
+DEFAULT_TAG_TEAM_PREFIX = ""
 
 # A pay-per-token Foundation Model API endpoint, invoked via the `ai_query()`
 # SQL function directly from the SQL Statement Execution API client - no
@@ -103,6 +109,17 @@ class RunConfig:
     # live grammar - e.g. a service principal running unmasked ETL). Empty
     # by default: no EXCEPT clause is added, identical to prior behavior.
     policy_except_principals: list = field(default_factory=lambda: list(DEFAULT_POLICY_EXCEPT_PRINCIPALS))
+    # Namespaces every governed tag key (and, under PolicyScope.CATALOG,
+    # every policy name) this run creates with `<tag_team_prefix>_` right
+    # after the `abac_rls_`/`abac_colmask_` role prefix - e.g. "mobility" ->
+    # `abac_colmask_mobility_<catalog>_<schema>_<function>` instead of
+    # `abac_colmask_<catalog>_<schema>_<function>`. Lets multiple teams
+    # running this tool against the same metastore keep their governed tags
+    # (and CATALOG-scoped policies) distinguishable/independently
+    # discoverable. Empty (the default) omits it entirely - unchanged
+    # behavior. Must stay the same across Inventory -> Apply-ABAC ->
+    # Finalize for one migration, same rule as policy_scope.
+    tag_team_prefix: str = DEFAULT_TAG_TEAM_PREFIX
     prefer_existing_tags: bool = True
 
     # INVENTORY-only: best-effort LLM classification of each legacy row-filter

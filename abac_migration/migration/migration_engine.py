@@ -5,6 +5,7 @@ packages at once - everything else is composable/testable in isolation.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from ..audit.audit_repository import AuditRepository, MigrationAuditRecord
 from ..config.models import Mode, PolicyScope, RunConfig
 from ..inventory.inventory_manager import build_inventory_record
 from ..inventory.inventory_repository import InventoryRepository
-from ..rollback.rollback_manager import rollback_table
+from ..rollback.rollback_manager import RollbackResult, rollback_table
 from ..scope.scope_resolver import resolve_scope
 from ..uc_gateway.gateway import UnityCatalogGateway
 from ..uc_gateway.models import TableRef
@@ -39,7 +40,10 @@ _STRATEGY_BY_SCOPE = {
 
 def build_policy_strategy(config: RunConfig) -> PolicyStrategy:
     strategy_cls = _STRATEGY_BY_SCOPE[config.policy_scope]
-    return strategy_cls(to_principals=config.policy_to_principals, except_principals=config.policy_except_principals)
+    return strategy_cls(
+        to_principals=config.policy_to_principals, except_principals=config.policy_except_principals,
+        team_prefix=config.tag_team_prefix,
+    )
 
 
 @dataclass
@@ -165,7 +169,9 @@ def _run_migration(
                 all_tag_requests.extend(plugin.tag_requests(table, validation))
 
         if all_tag_requests:
-            provisioner = TagProvisioner(uc, prefer_existing_tags=config.prefer_existing_tags)
+            provisioner = TagProvisioner(
+                uc, prefer_existing_tags=config.prefer_existing_tags, team_prefix=config.tag_team_prefix,
+            )
             resolved = provisioner.prepare(all_tag_requests, dry_run=config.dry_run)
 
     results = [None] * len(eligible_tables)
@@ -173,6 +179,7 @@ def _run_migration(
         future_to_idx = {
             pool.submit(
                 convert_table, table, uc, config.dry_run, strategy, resolved, config.prefer_existing_tags, phase,
+                config.tag_team_prefix,
             ): i
             for i, table in enumerate(eligible_tables)
         }
@@ -209,19 +216,89 @@ def _run_verify_or_reconcile(config, tables, uc, audit_repo, strategy) -> list:
     return results
 
 
-def _run_rollback(config, uc, audit_repo, strategy) -> list:
+def _run_rollback(config: RunConfig, uc: UnityCatalogGateway, audit_repo: AuditRepository, strategy: PolicyStrategy) -> list:
+    """§9/§14 resilience (explicit requirement): every audit row for this
+    run_id is rolled back independently. One row's failure - whether a
+    normal FAILED outcome from rollback_table() itself, or a totally
+    unexpected exception (malformed rollback_metadata JSON, a bad
+    catalog/schema/table value, anything) - is recorded to migration_audit
+    and the loop moves on to the next row. ROLLBACK never aborts the whole
+    job over one bad row; previously it did (an uncaught exception here
+    propagated all the way out of run() and failed the entire job task),
+    AND it never wrote anything to migration_audit at all, successful or
+    not - both fixed here."""
     rows = audit_repo.rows_for_run(config.run_id)
     results = []
     for row in rows:
         row_dict = dict(zip(_MIGRATION_AUDIT_COLUMNS, row))
         rollback_metadata_raw = row_dict.get("rollback_metadata")
         if not rollback_metadata_raw:
-            continue
-        import json
-        table = TableRef(row_dict["catalog"], row_dict["schema"], row_dict["table"])
-        rollback_metadata = json.loads(rollback_metadata_raw) if isinstance(rollback_metadata_raw, str) else rollback_metadata_raw
-        results.append(rollback_table(table, rollback_metadata, uc, config.dry_run, strategy))
+            continue  # nothing to roll back for this row - not a failure, nothing to record
+
+        table = TableRef(row_dict.get("catalog") or "", row_dict.get("schema") or "", row_dict.get("table") or "")
+        try:
+            rollback_metadata = (
+                json.loads(rollback_metadata_raw) if isinstance(rollback_metadata_raw, str) else rollback_metadata_raw
+            )
+            result = rollback_table(table, rollback_metadata, uc, config.dry_run, strategy)
+        except Exception as exc:  # noqa: BLE001 - converted into a normal, audit-visible
+            # FAILED result instead of propagating and aborting every remaining row's
+            # rollback (and the whole job) - see function docstring.
+            result = RollbackResult(
+                table_name=table.full_name, status=StepStatus.FAILED,
+                error_message=f"Unexpected error while rolling back this row: {exc}",
+            )
+
+        results.append(result)
+        _persist_rollback_result(audit_repo, config, table, result)
+
     return results
+
+
+# Coarse "how far along" signal for migration_audit.migration_phase,
+# ROLLBACK's own equivalent of table_converter._migration_phase_for() for
+# the forward migration path.
+_ROLLBACK_PHASE_BY_STATUS = {
+    StepStatus.ROLLED_BACK: "ROLLED_BACK",
+    StepStatus.WOULD_ROLLBACK: "DRY_RUN",
+    StepStatus.FAILED: "ROLLBACK_FAILED",
+    StepStatus.SKIPPED: "NOT_APPLICABLE",
+}
+
+
+def _persist_rollback_result(
+    audit_repo: AuditRepository, config: RunConfig, table: TableRef, result: RollbackResult,
+) -> None:
+    """Always writes at least one migration_audit row per rollback attempt,
+    including a SKIPPED/no-op or FAILED one - previously ROLLBACK wrote
+    NOTHING to the audit table at all, regardless of outcome. One row per
+    underlying step_result when rollback_table() produced any (mirrors
+    _persist_conversion_result's per-object granularity, §4.2); exactly one
+    summary row when it short-circuited before producing any (SKIPPED - no
+    rollback_metadata, or an unexpected top-level exception caught in
+    _run_rollback above)."""
+    steps = result.step_results or [None]
+    for step in steps:
+        if step is None:
+            record = MigrationAuditRecord(
+                run_id=config.run_id, attempt_id=str(uuid.uuid4()),
+                catalog=table.catalog, schema=table.schema, table=table.table,
+                object_type="NONE", status=result.status.value,
+                error_message=result.error_message,
+                migration_phase=_ROLLBACK_PHASE_BY_STATUS.get(result.status, "NOT_APPLICABLE"),
+                started_at=result.started_at, completed_at=result.completed_at, dry_run=config.dry_run,
+            )
+        else:
+            record = MigrationAuditRecord(
+                run_id=config.run_id, attempt_id=str(uuid.uuid4()),
+                catalog=table.catalog, schema=table.schema, table=table.table,
+                object_type=step.object_type, masked_column=step.masked_column,
+                source_function=step.source_function, target_policy_name=step.target_policy_name,
+                status=step.status.value, error_code=step.error_code, error_message=step.error_message,
+                migration_phase=_ROLLBACK_PHASE_BY_STATUS.get(step.status, "NOT_APPLICABLE"),
+                started_at=result.started_at, completed_at=result.completed_at, dry_run=config.dry_run,
+            )
+        audit_repo.append(record, dry_run=config.dry_run)
 
 
 _MIGRATION_AUDIT_COLUMNS = [

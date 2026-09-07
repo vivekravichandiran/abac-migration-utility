@@ -84,3 +84,16 @@ def test_policy_scope_rejects_unknown_value():
             "mode": "INVENTORY", "scope_type": "ALL_CATALOGS", "audit_catalog": "audit_cat",
             "audit_schema": "audit_sch", "policy_scope": "SCHEMA_BASED_TYPO",
         })
+
+
+def test_tag_team_prefix_defaults_to_empty():
+    config = RunConfig(scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s")
+    assert config.tag_team_prefix == ""
+
+
+def test_tag_team_prefix_parses_from_widget_string():
+    config = load_from_dict({
+        "mode": "APPLY_ABAC", "scope_type": "ALL_CATALOGS", "audit_catalog": "audit_cat",
+        "audit_schema": "audit_sch", "tag_team_prefix": "mobility",
+    })
+    assert config.tag_team_prefix == "mobility"

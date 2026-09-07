@@ -311,6 +311,70 @@ def test_new_column_colliding_with_a_pre_existing_key_only_assignment_gets_a_val
     assert mc.tag_value in fake.governed_tags[RF_TAG_KEY].values
 
 
+# ---------------------------------------------------------------------------
+# team_prefix (RunConfig.tag_team_prefix): optional namespace segment right
+# after the abac_rls_/abac_colmask_ role prefix, for multi-team migrations
+# against the same metastore. Omitted entirely when empty (default,
+# unchanged behavior - already covered by every test above using the
+# 2-arg tag_key_for_function(fn, role) call form).
+# ---------------------------------------------------------------------------
+
+def test_tag_key_for_function_with_team_prefix_inserts_segment_after_role():
+    key = tag_key_for_function("cat.sch.rf_region_both", "row_filter", "mobility")
+    assert key == "abac_rls_mobility_cat_sch_rf_region_both"
+
+
+def test_tag_key_for_function_empty_team_prefix_matches_no_prefix_default():
+    assert tag_key_for_function(RF_FN, "row_filter", "") == RF_TAG_KEY
+    assert tag_key_for_function(RF_FN, "row_filter") == RF_TAG_KEY
+
+
+def test_tag_key_for_function_team_prefix_is_sanitized():
+    # Same sanitization rule as catalog/schema/function-name (hyphens etc.
+    # replaced with `_`, no exceptions for team_prefix).
+    key = tag_key_for_function("cat.sch.rf_region_both", "row_filter", "team-mobility")
+    assert key == "abac_rls_team_mobility_cat_sch_rf_region_both"
+    assert "-" not in key
+
+
+def test_tag_key_for_function_different_team_prefixes_are_distinct_keys():
+    key_a = tag_key_for_function(RF_FN, "row_filter", "mobility")
+    key_b = tag_key_for_function(RF_FN, "row_filter", "payments")
+    assert key_a != key_b
+    assert key_a != RF_TAG_KEY
+    assert key_b != RF_TAG_KEY
+
+
+def test_provisioner_team_prefix_mints_namespaced_tag_key():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, team_prefix="mobility")
+    resolved = provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    mc = resolved[(table, "business_unit", "row_filter")]
+    expected_key = tag_key_for_function(RF_FN, "row_filter", "mobility")
+    assert mc.tag_key == expected_key
+    assert expected_key in fake.governed_tags
+    assert RF_TAG_KEY not in fake.governed_tags  # no-prefix key never minted
+
+
+def test_provisioner_default_team_prefix_is_empty_and_unchanged():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake)
+    resolved = provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert resolved[(table, "business_unit", "row_filter")].tag_key == RF_TAG_KEY
+
+
 def test_long_or_unusual_function_name_produces_valid_truncated_key_with_no_hash():
     fake = FakeUnityCatalogGateway()
     table = TableRef("cat", "sch", "t1")

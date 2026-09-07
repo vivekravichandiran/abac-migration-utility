@@ -544,6 +544,51 @@ a step between `validate()` and `convert()`'s `CREATE POLICY` call:
    Trade-off accepted deliberately: many more tag keys for a large
    migration (one per distinct function, not a constant 2) in exchange for
    per-function auditability.
+2a. **Optional team/tenant namespace prefix (`tag_team_prefix` config/job
+   parameter, default empty — REVISED, added on request).** Multiple teams
+   running this utility against the *same* metastore end up minting
+   governed tags into the same account-wide namespace (point 1's "shared
+   namespace" concern) — `tag_team_prefix` lets each team's run insert its
+   own sanitized segment right after the `abac_rls_`/`abac_colmask_` role
+   prefix, e.g. `tag_team_prefix="mobility"` turns
+   `abac_colmask_cat_sch_mask_ssn_fn` into
+   `abac_colmask_mobility_cat_sch_mask_ssn_fn` — so
+   `SHOW GOVERNED TAGS LIKE 'abac_%_mobility_%'` scopes discovery/cleanup
+   to just that team's tags. Sanitized identically to catalog/schema/
+   function-name (shared `sanitize_name_part()` helper, same hyphen-to-`_`
+   rule) and simply omitted when empty (zero behavior change for anyone
+   not using it). **Crucially, this ALSO namespaces every policy name this
+   run creates, under BOTH `PolicyScope`s** (§7.3.1) — not just the
+   governed tag key: `CatalogBasedPolicyStrategy` gets this for free since
+   it already reuses the tag key verbatim as its policy name, but
+   `TableBasedPolicyStrategy`'s previously-*constant* policy names
+   (`abac_migrated_row_filter`/`abac_migrated_mask_<column>`) are now ALSO
+   namespaced the same way (`abac_<team_prefix>_migrated_row_filter`/
+   `abac_<team_prefix>_migrated_mask_<column>`) — every object (tag AND
+   policy) one team's run creates is consistently identifiable, regardless
+   of policy_scope. Must be the identical value across
+   Inventory → Apply-ABAC → Finalize for one migration (same rule as
+   `policy_scope` itself): `TableBasedPolicyStrategy.find_existing_row_filter_policy`/
+   `find_existing_mask_policies` look up the policy by its (possibly
+   prefixed) deterministic name, so a mismatched prefix at Finalize time
+   means it looks for a name that was never created and safely no-ops
+   (`ABAC_NOT_APPLIED_YET`) rather than erroring or silently succeeding.
+   `CatalogBasedPolicyStrategy`'s own existing-policy recovery (point 4
+   above, via column tags rather than a policy name lookup) needed a
+   matching fix, confirmed live: it originally filtered candidate tags with
+   a bare `tag.tag_key.startswith("abac_rls_"/"abac_colmask_")` check with
+   no team/catalog/schema scoping at all, so re-running `APPLY_ABAC` with a
+   *new* `tag_team_prefix` against a catalog a prior no-prefix (or
+   differently-prefixed) run had already `FINALIZE`d incorrectly reported
+   every one of that catalog's tables as `ALREADY_MIGRATED` - the leftover,
+   different-team column tag still satisfied the bare-prefix check.
+   `CatalogBasedPolicyStrategy._tag_prefix_for_table()` now reconstructs the
+   full deterministic prefix (role + `team_prefix` + THIS table's own
+   catalog + schema, everything `tag_key_for_function` would produce except
+   the still-unknown function name) before filtering, so a differently-
+   scoped run's tags are correctly invisible.
+
+
 3. **`ALTER GOVERNED TAG ... SET VALUES (...)` is declarative/full-replace,
    not additive** (confirmed via docs and empirically) — the provided list
    *replaces* the entire allowed-values list. This is a **write-write race
@@ -600,8 +645,10 @@ mixed within one run:
 2. Create one governed tag per legacy function (`tag_provisioner.py`, §7.4).
 3. Apply that tag to the relevant column(s) on the table.
 4. Create the ABAC policy scoped `ON TABLE` — one `ROW_FILTER` policy per
-   table (`abac_migrated_row_filter`) and one `COLUMN_MASK` policy per
-   masked column (`abac_migrated_mask_<column>`), per §7.3.
+   table (`abac_migrated_row_filter`, or `abac_<tag_team_prefix>_migrated_row_filter`
+   when a team prefix is configured, §7.4 point 2a) and one `COLUMN_MASK`
+   policy per masked column (`abac_migrated_mask_<column>`, likewise
+   namespaced), per §7.3.
 5. Manual review (`APPLY_ABAC` leaves both mechanisms live —
    `migration_audit.migration_phase=ABAC_APPLIED`, explicitly not final —
    so an operator can confirm the new `ON TABLE` policy produces identical
@@ -729,6 +776,49 @@ Crucially: **at no point does "remove legacy" happen before "verify ABAC."**
 The one failure mode that leaves two mechanisms active simultaneously
 (over-protective, never under-protective) is explicitly preferred over any
 path that could leave a table briefly unprotected.
+
+### 8.1 `Mode.ROLLBACK` resilience (REVISED — every row is independent, best-effort)
+
+`ROLLBACK` operates over the `migration_audit` rows for one `run_id`
+(`migration_engine._run_rollback`), one row at a time, via
+`rollback.rollback_manager.rollback_table()`. This is deliberately a
+**best-effort cleanup pass, never all-or-nothing** — a single row/table
+failing (or an outright unexpected exception, e.g. malformed
+`rollback_metadata` JSON) must never abort every *other* row's rollback
+attempt, and previously it did (an uncaught exception propagated all the
+way out of `run()` and failed the entire job task), while also writing
+**nothing at all** to `migration_audit` regardless of outcome. Both fixed:
+
+- **Per-plugin isolation** (`rollback_table()`): the RLS and column-mask
+  plugins' `.rollback()` calls are each individually try/except-wrapped —
+  an exception raised restoring the legacy row filter can never suppress
+  the column-mask plugin's own rollback attempt for the *same* table (and
+  vice versa). A caught exception becomes a normal `FAILED`
+  `ConversionStepResult` (`error_code=ROLLBACK_FAILED`), exactly how every
+  other mutating call site in this codebase already treats an unexpected
+  gateway exception — never bubbled raw.
+- **Per-row isolation** (`migration_engine._run_rollback`): the same
+  policy one level up, across different audit rows/tables — parsing
+  `rollback_metadata` JSON, building the `TableRef`, and calling
+  `rollback_table()` are wrapped in one try/except per row; any exception
+  becomes a `FAILED` `RollbackResult` and the loop unconditionally
+  continues to the next row (this is **not** gated by
+  `continue_on_error` — rollback is a safety/cleanup operation where
+  attempting every row is always preferred over stopping early).
+- **Full audit coverage** (new): every row's outcome — `ROLLED_BACK`,
+  `WOULD_ROLLBACK` (dry run), `FAILED`, or `SKIPPED` (no
+  `rollback_metadata`/nothing applicable) — is now persisted to
+  `migration_audit` via `_persist_rollback_result()`, with
+  `migration_phase` set to `ROLLED_BACK`/`DRY_RUN`/`ROLLBACK_FAILED`/
+  `NOT_APPLICABLE` respectively (ROLLBACK's own equivalent of
+  `table_converter._migration_phase_for()` for the forward-migration
+  path). Previously `ROLLBACK` wrote nothing to the audit table at all,
+  successful or not — an operator had no durable record a rollback run
+  even happened.
+
+Covered end-to-end (fault injection via `FakeUnityCatalogGateway.set_fault`,
+malformed-JSON rows, dry-run, and skip-with-no-metadata) in
+`tests/test_rollback_resilience.py`.
 
 ---
 
@@ -871,6 +961,7 @@ Rules:
 | `policy_scope` | str enum | `TABLE` | `TABLE`\|`CATALOG` (§7.3.1) — "table level application" (`ON TABLE`, one policy per table/masked column) vs. "catalog level application" (`ON CATALOG`, one policy per legacy function shared by every table that used it) |
 | `policy_to_principals` | JSON array (str) | `["account users"]` | overridable if an org wants a narrower default `TO` clause |
 | `policy_except_principals` | JSON array (str) | `[]` | principals fully exempted (`TO ... EXCEPT principal [, ...]`, confirmed live CREATE POLICY grammar) from every ABAC policy this run creates - e.g. a service principal that runs unmasked ETL, or a break-glass admin group. Empty = no `EXCEPT` clause, unchanged prior behavior |
+| `tag_team_prefix` | str | `""` (empty) | optional namespace segment (§7.4 point 2a) inserted right after `abac_rls_`/`abac_colmask_` in every governed tag key AND every policy name this run creates, under BOTH `policy_scope`s - e.g. `"mobility"` -> `abac_colmask_mobility_<cat>_<sch>_<fn>`. Empty = omitted entirely, unchanged prior behavior. Must be identical across Inventory -> Apply-ABAC -> Finalize, same rule as `policy_scope` |
 | `enable_llm_pii_tagging` | bool | `false` | `INVENTORY`-only, advisory: classify each legacy function's likely PII category via `ai_query()` from its name+columns alone (never row data) |
 | `pii_llm_endpoint` | str | `databricks-meta-llama-3-3-70b-instruct` | Foundation Model API endpoint used by `enable_llm_pii_tagging` |
 | `run_id` | str | generated UUID if blank | allows resuming/correlating a specific run, e.g. for `ROLLBACK` mode targeting one prior run |

@@ -112,6 +112,22 @@ variables:
       Exempted principals see fully unmasked/unfiltered data. Empty (the
       default) omits the `EXCEPT` clause entirely - unchanged behavior.
     default: "[]"
+  tag_team_prefix:
+    description: >-
+      Optional namespace segment inserted right after the `abac_rls_`/
+      `abac_colmask_` role prefix in every governed tag key this run mints
+      (and, under policy_scope=CATALOG, in every ABAC policy name too,
+      since CatalogBasedPolicyStrategy reuses the tag key verbatim as its
+      policy name - see DESIGN.md §7.4/§7.3.1). E.g. "mobility" turns
+      `abac_colmask_<catalog>_<schema>_<function>` into
+      `abac_colmask_mobility_<catalog>_<schema>_<function>`. Lets multiple
+      teams running this tool against the same metastore keep their
+      governed tags/policies independently discoverable
+      (`SHOW GOVERNED TAGS LIKE 'abac_%_mobility_%'`). Empty (the default)
+      omits it entirely - unchanged behavior. Must be the same value across
+      Inventory -> Apply-ABAC -> Finalize for one migration, same rule as
+      policy_scope.
+    default: ""
 
 targets:
   source:

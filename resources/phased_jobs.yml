@@ -14,8 +14,12 @@ resources:
         what you intend to run Apply-ABAC/Finalize with, since it changes
         which existing-ABAC-policy state INVENTORY looks for (a table-scoped
         policy `ON TABLE` vs. a catalog-scoped one `ON CATALOG` recovered via
-        governed column tags only). Run this first, review the inventory
-        table, then run "ABAC Migration - 2. Apply ABAC".
+        governed column tags only). `tag_team_prefix` is accepted here too
+        for parameter-parity with the other 2 phases but is inert for
+        INVENTORY's own detection logic (it reads whatever tag key is
+        already on a column, never reconstructs one) - only Apply-ABAC/
+        Finalize actually need it to match. Run this first, review the
+        inventory table, then run "ABAC Migration - 2. Apply ABAC".
       max_concurrent_runs: 1
       tasks:
         - task_key: run_inventory
@@ -33,6 +37,7 @@ resources:
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
               policy_scope: ${var.policy_scope}
+              tag_team_prefix: ${var.tag_team_prefix}
               prefer_existing_tags: "true"
               enable_llm_pii_tagging: "true"
           environment_key: default
@@ -61,7 +66,13 @@ resources:
         used for Inventory and Finalize in the same pipeline run. Override
         `policy_except_principals` (JSON array, default `[]`) to exempt
         specific principals - e.g. a service principal running unmasked
-        ETL - from every ABAC policy this run creates.
+        ETL - from every ABAC policy this run creates. Override
+        `tag_team_prefix` (default empty) to namespace every governed tag
+        key (and, under `policy_scope=CATALOG`, every policy name) this run
+        mints with `<tag_team_prefix>_` right after `abac_rls_`/
+        `abac_colmask_` - e.g. "mobility" ->
+        `abac_colmask_mobility_<catalog>_<schema>_<function>`. Must match
+        the value used for Finalize in the same pipeline run.
       max_concurrent_runs: 1
       tasks:
         - task_key: run_apply_abac
@@ -80,6 +91,7 @@ resources:
               audit_schema: ${var.audit_schema}
               policy_scope: ${var.policy_scope}
               policy_except_principals: ${var.policy_except_principals}
+              tag_team_prefix: ${var.tag_team_prefix}
               prefer_existing_tags: "true"
           environment_key: default
       environments:
@@ -100,7 +112,10 @@ resources:
         `policy_scope` must match what Inventory/Apply-ABAC used for this
         `catalogs` scope (`TABLE` default | `CATALOG`) - it determines
         which ABAC policy Finalize looks for before removing the legacy
-        row filter/column mask.
+        row filter/column mask. `tag_team_prefix` must likewise match what
+        Apply-ABAC used - Finalize reconstructs the deterministic policy
+        name to verify before removing legacy, and a mismatched prefix
+        means it will never find (and never remove) anything.
       max_concurrent_runs: 1
       tasks:
         - task_key: run_finalize
@@ -118,6 +133,7 @@ resources:
               audit_catalog: ${var.audit_catalog}
               audit_schema: ${var.audit_schema}
               policy_scope: ${var.policy_scope}
+              tag_team_prefix: ${var.tag_team_prefix}
               prefer_existing_tags: "true"
           environment_key: default
       environments:

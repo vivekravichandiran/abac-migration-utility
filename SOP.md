@@ -114,6 +114,44 @@ compute. Typical use: a service principal running unmasked ETL, or a
 break-glass admin group. Leave empty (the default) for no exemptions —
 generated SQL is unchanged from before this option existed.
 
+### 2.3 Namespacing for multi-team migrations: `tag_team_prefix`
+
+If **more than one team** runs this utility against the *same* metastore,
+every governed tag key (and, as of this revision, every policy name too —
+see below) lands in one shared, account-wide namespace by default. Set
+**`tag_team_prefix`** (default `""`, empty) to a short team/tenant name to
+keep each team's objects independently discoverable:
+
+- Governed tag keys: `abac_colmask_<catalog>_<schema>_<function>` becomes
+  `abac_colmask_<tag_team_prefix>_<catalog>_<schema>_<function>` — e.g.
+  `tag_team_prefix="mobility"` turns `abac_colmask_ril_raw_hr_mask_ssn_fn`
+  into `abac_colmask_mobility_ril_raw_hr_mask_ssn_fn`.
+- Policy names, **under both `policy_scope` values**:
+  - `policy_scope=CATALOG`: automatic — `CatalogBasedPolicyStrategy` reuses
+    the (now-prefixed) tag key verbatim as the policy name.
+  - `policy_scope=TABLE`: the previously-*constant* policy names
+    `abac_migrated_row_filter` / `abac_migrated_mask_<column>` become
+    `abac_<tag_team_prefix>_migrated_row_filter` /
+    `abac_<tag_team_prefix>_migrated_mask_<column>`.
+
+Find your team's objects later with e.g.
+`SHOW GOVERNED TAGS LIKE 'abac_%_mobility_%'` or, on the table itself,
+`SHOW POLICIES ON TABLE <table>` and look for the `abac_mobility_...`
+names. Leave empty (the default) if only one team ever runs this tool
+against a given metastore — behavior is byte-for-byte unchanged from
+before this option existed. **Must be the identical value across
+`INVENTORY` → `APPLY_ABAC` → `FINALIZE`** for one migration, same rule as
+`policy_scope` (§2.1) — a mismatch at `FINALIZE` time means it reconstructs
+a *different* deterministic name, never finds the policy `APPLY_ABAC`
+actually created, and safely no-ops instead of removing the legacy
+mechanism (never a false success, never a crash — just stuck at
+`ABAC_NOT_APPLIED_YET` until you rerun with the matching prefix).
+
+The bundle's `tag_team_prefix` variable (`databricks.yml`, default `""`) is
+already wired into `abac_migration_job` and all three phased jobs
+(`resources/jobs.yml` / `resources/phased_jobs.yml`) — override it per
+target/team, or pass it at "Run now with different parameters".
+
 ---
 
 ## 3. One-time setup (do this once per workspace)
@@ -582,6 +620,21 @@ column of `migration_audit`, or from that run's own report).
    - `FAILED` — check `error_message`; the table may be left in a mixed
      state, investigate live before retrying.
 
+   **Resilience (REVISED):** `ROLLBACK` is a best-effort pass over every
+   `migration_audit` row for `run_id` — one row failing (even an
+   unexpected error, e.g. a table that's since been dropped) never aborts
+   the rest; every remaining row is still attempted, and **every** outcome
+   (`ROLLED_BACK`/`WOULD_ROLLBACK`/`FAILED`/`SKIPPED`) is now written back
+   to `migration_audit` (`migration_phase` = `ROLLED_BACK`/`DRY_RUN`/
+   `ROLLBACK_FAILED`/`NOT_APPLICABLE`) so you always have a durable record
+   of what a `ROLLBACK` run actually did, not just what `other_results`
+   showed in that one job run's output. If any row shows `FAILED`, rerun
+   `ROLLBACK` with the same `run_id` after investigating — already-rolled-
+   back rows are simply re-attempted harmlessly (their `rollback_metadata`
+   still points at the same, by-then-already-removed policy, so
+   `drop_policy` is a safe no-op and the legacy mechanism is just
+   re-verified as already restored).
+
 5. Spot-check a rolled-back table live: `DESCRIBE TABLE EXTENDED` should
    show the legacy row filter/mask restored; `SHOW POLICIES ON TABLE`
    should no longer list the policy that run created.
@@ -698,6 +751,7 @@ Find its `run_id` in `migration_audit` → `ROLLBACK` with `dry_run=true`
 | `policy_scope` | mutating modes | `TABLE` | `TABLE` \| `CATALOG` — see §2A/§2B below. Must be the same value across `INVENTORY` → `APPLY_ABAC` → `FINALIZE` for one migration; the tool cannot detect if you mix scopes across the isolated phases |
 | `policy_to_principals` | mutating modes | `["account users"]` | JSON list |
 | `policy_except_principals` | mutating modes | `[]` | JSON list of users/groups/service principals to **exempt** from every ABAC policy this run creates (`TO ... EXCEPT <principal>`) — e.g. `["etl_service_principal"]`. Exempted principals see fully unmasked/unfiltered data. Empty = no exemptions (unchanged behavior) |
+| `tag_team_prefix` | mutating modes | `""` | namespaces every governed tag key AND every policy name (both `policy_scope`s) this run creates — see §2.3. Must be the same value across `INVENTORY` → `APPLY_ABAC` → `FINALIZE`, same rule as `policy_scope` |
 | `prefer_existing_tags` | mutating modes | `true` | reuse a compatible existing governed tag instead of minting a new one, if found |
 | `enable_llm_pii_tagging` | `INVENTORY` only | `false` | LLM-suggested PII category per legacy function — advisory only |
 | `pii_llm_endpoint` | `INVENTORY` only, when the above is `true` | `databricks-meta-llama-3-3-70b-instruct` | override if that model isn't enabled on your account |

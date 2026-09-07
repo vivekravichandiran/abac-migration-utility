@@ -176,6 +176,27 @@ and see fully unmasked/unfiltered data. Typical use: a service principal
 running unmasked ETL, or a break-glass admin group. Empty means no `EXCEPT`
 clause is generated at all.
 
+### `tag_team_prefix`: namespacing for multi-team migrations
+
+All mutating modes also read `tag_team_prefix` (str, default `""`). When
+more than one team runs this utility against the same metastore, every
+governed tag key (`tag_provisioner.tag_key_for_function`) lands in the same
+shared, account-wide namespace by default. A non-empty `tag_team_prefix`
+inserts a sanitized segment right after the `abac_rls_`/`abac_colmask_` role
+prefix — e.g. `tag_team_prefix="mobility"` turns
+`abac_colmask_cat_sch_mask_ssn_fn` into
+`abac_colmask_mobility_cat_sch_mask_ssn_fn`. This **also** namespaces every
+policy name this run creates under both `policy_scope`s — automatic under
+`CATALOG` (`CatalogBasedPolicyStrategy` reuses the tag key as the policy
+name), and, as of this revision, under `TABLE` too: the previously-constant
+`abac_migrated_row_filter` / `abac_migrated_mask_<column>` become
+`abac_<tag_team_prefix>_migrated_row_filter` /
+`abac_<tag_team_prefix>_migrated_mask_<column>`. Empty (the default) omits
+it entirely — unchanged behavior. Must be the same value across
+`INVENTORY`/`APPLY_ABAC`/`FINALIZE` for one migration, same rule as
+`policy_scope` — see `abac_migration/DESIGN.md` §7.4 point 2a and `SOP.md`
+§2.3.
+
 ### `VERIFY`
 
 Read-only. For every table in scope, re-runs the same discover/verify
@@ -222,6 +243,16 @@ Reported per-object as `ROLLED_BACK` / `WOULD_ROLLBACK` (dry run) /
 `FAILED` / `SKIPPED` (no rollback metadata available for that row). Like
 every other mutating mode, `dry_run=true` (default) short-circuits before
 any real mutation.
+
+**Resilience:** every audit row for `run_id` is rolled back independently —
+one row failing (a normal `FAILED` result, or an unexpected exception, e.g.
+malformed `rollback_metadata`) never aborts the rest; the loop always moves
+on to the next row, and this is not gated by `continue_on_error` (rollback
+always attempts everything). Every outcome, success or failure, is now
+persisted to `migration_audit` (`migration_phase` =
+`ROLLED_BACK`/`DRY_RUN`/`ROLLBACK_FAILED`/`NOT_APPLICABLE`) — previously
+`ROLLBACK` wrote nothing to the audit table at all. See
+`abac_migration/DESIGN.md` §8.1 and `tests/test_rollback_resilience.py`.
 
 ## Governed tags: one tag key per legacy function
 

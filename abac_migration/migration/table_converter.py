@@ -99,6 +99,7 @@ def convert_table(
     resolved_match_columns: Optional[dict] = None,
     prefer_existing_tags: bool = True,
     phase: str = "FULL",
+    team_prefix: str = "",
 ) -> ConversionResult:
     """Runs discover->validate->convert for both plugin types against one
     table (§5 point 2). `resolved_match_columns` lets a caller (typically
@@ -119,6 +120,12 @@ def convert_table(
     and never creates one itself. Tag resolution is skipped entirely for
     "FINALIZE" - by construction it never needs a MatchColumn it didn't
     already have from a prior APPLY_ABAC/FULL run.
+
+    `team_prefix` (RunConfig.tag_team_prefix) is only consulted by the
+    fallback TagProvisioner instantiated above for any tag this table still
+    needs that migration_engine's serialized "Prepare Governed Tags" phase
+    didn't already resolve into `resolved_match_columns` - must match
+    whatever prefix that phase used for the same run (see migration_engine.py).
     """
     started_at = dt.datetime.utcnow()
     strategy = policy_strategy or TableBasedPolicyStrategy()
@@ -139,7 +146,7 @@ def convert_table(
     if phase != "FINALIZE":
         missing = [r for r in all_tag_requests if (r.table, r.column, r.role) not in resolved]
         if missing:
-            provisioner = TagProvisioner(uc, prefer_existing_tags=prefer_existing_tags)
+            provisioner = TagProvisioner(uc, prefer_existing_tags=prefer_existing_tags, team_prefix=team_prefix)
             resolved.update(provisioner.prepare(missing, dry_run=dry_run))
 
     options = ConvertOptions(dry_run=dry_run, resolved_match_columns=resolved, phase=phase)
