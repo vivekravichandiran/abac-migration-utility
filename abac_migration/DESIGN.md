@@ -520,30 +520,53 @@ a step between `validate()` and `convert()`'s `CREATE POLICY` call:
    different raw names onto the same key, or a pre-existing unrelated
    governed tag already occupying the exact deterministic key — raises
    `TagKeyCollisionError` loudly rather than silently merging/hijacking.
-   **Value is only added when actually needed for disambiguation** (REVISED
-   — see `tag_provisioner._split_by_collision()`). Confirmed live: a
-   plain **key-only** governed tag (`CREATE GOVERNED TAG key`, no
-   `VALUES`) plus `MATCH COLUMNS has_tag(key)` compiles fine at `CREATE
-   POLICY` time even when the same key ends up on 2+ columns of the same
-   table, but then fails **every read** with `UC_ABAC_AMBIGUOUS_COLUMN_MATCH:
-   ... had 2 matches, exactly 1 match is allowed`. So: if a function guards
-   exactly one column within a given table (the overwhelmingly common
-   case, even when that same function also guards a column in a
-   *different* table — `MATCH COLUMNS` is table-scoped), that column gets
-   a **key-only** tag, no value, no "Allowed values" entry at all. Only
-   when a function guards **more than one column of the same table**
-   (e.g. a row filter with 2 `USING COLUMNS`, or a generic mask function
-   reused for 2 columns) do those specific colliding columns each get
-   their own **unique value** — a short hash of
-   `<catalog>.<schema>.<table>.<column>.<role>` (256-char tag value length
-   limit, confirmed via docs) — added to that key's allowed-values list, so
-   each is matched via `has_tag_value(key, value)` instead. A
-   cross-run variant of the same check (a NEW column colliding with an
-   *already-tagged* column from a prior run, discovered via
-   `list_column_tags`) is handled the same way.
+   **No tag VALUE is ever minted, for either role (REVISED again on
+   request — the prior per-column disambiguating-value fallback below has
+   been REMOVED)**. Confirmed live: a plain **key-only** governed tag
+   (`CREATE GOVERNED TAG key`, no `VALUES`) plus `MATCH COLUMNS
+   has_tag(key)` compiles fine at `CREATE POLICY` time even when the same
+   key ends up on 2+ columns of the same table, but then fails **every
+   read** with `UC_ABAC_AMBIGUOUS_COLUMN_MATCH: ... had 2 matches, exactly
+   1 match is allowed`. The two roles now diverge in how they handle that
+   risk, confirmed by dedicated live testing of both:
+   - **COLUMN_MASK**: sharing one bare key-only tag across 2+ columns of
+     the same table is **completely safe** — confirmed live, `has_tag(key)`
+     resolves independently per column at mask-application time, no
+     ambiguity error at all. So masks ALWAYS get a key-only tag,
+     unconditionally, regardless of how many columns of a table share the
+     underlying function's tag key.
+   - **ROW_FILTER**: the ambiguity above is real, and Unity Catalog only
+     allows a single active row filter per table anyway, so 2 columns of
+     one table genuinely needing the identical RLS tag key (e.g. a row
+     filter function with 2+ `USING COLUMNS`, or the same function reused
+     across 2 columns) is not a supportable configuration for this tool.
+     Rather than minting a disambiguating value (the old behavior, now
+     removed), `tag_provisioner._split_by_collision()` **skips assigning a
+     tag to those columns entirely** — they are left out of `prepare()`'s
+     returned `resolved` dict. `rls_to_abac.py`'s
+     `_build_match_columns_or_fail` then fails **only that table's**
+     ROW_FILTER step with a dedicated `RLS_TAG_COLLISION_UNRESOLVABLE`
+     error code, recorded to `migration_audit` like any other per-object
+     failure — the run is **not aborted**, and every other table
+     (including that same table's column masks, which have no such
+     restriction) proceeds normally. Confirmed live on a dedicated fixture
+     (a 2-argument row filter function applied to one table): the
+     ROW_FILTER step failed with `RLS_TAG_COLLISION_UNRESOLVABLE`, no tag
+     was ever assigned to either colliding column, the legacy row filter
+     was left completely untouched/still enforcing, and the run still
+     completed and audited a sibling mask-collision table (same shared
+     key-only tag pattern) as `ABAC_APPLIED` with zero
+     `UC_ABAC_AMBIGUOUS_COLUMN_MATCH` errors on `SELECT`.
+   `TagProvisioner.last_row_filter_collisions` (reset on every `prepare()`
+   call) exposes the list of skipped `TagRequest`s purely for introspection/
+   testing — no production code path consults it; the audit trail via the
+   FAILED step above is the operator-facing signal.
    Trade-off accepted deliberately: many more tag keys for a large
    migration (one per distinct function, not a constant 2) in exchange for
-   per-function auditability.
+   per-function auditability, and a hard manual-remediation requirement for
+   any row filter function that genuinely needs 2+ columns of one table
+   (rare in practice — confirmed none of this repo's own fixture functions
+   are multi-argument).
 2a. **Optional team/tenant namespace prefix (`tag_team_prefix` config/job
    parameter, default empty — REVISED, added on request).** Multiple teams
    running this utility against the *same* metastore end up minting
@@ -854,7 +877,12 @@ Output shape mirrors the doc's example exactly:
   `SOURCE_FUNCTION_INCOMPATIBLE`, `POLICY_CREATE_FAILED`,
   `POLICY_VERIFY_FAILED`, `EXISTING_ABAC_POLICY_CONFLICT`,
   `LEGACY_REMOVAL_FAILED`, `FINAL_STATE_VERIFY_FAILED`, `PERMISSION_DENIED`,
-  `UNSUPPORTED_TABLE_TYPE`, `TRANSIENT_API_ERROR`, `UNKNOWN`.
+  `UNSUPPORTED_TABLE_TYPE`, `TRANSIENT_API_ERROR`,
+  `RLS_TAG_COLLISION_UNRESOLVABLE` (§7.4 point 2 — 2+ columns of one table
+  would need the identical bare row-filter tag key; no value is minted to
+  disambiguate anymore, so this table's ROW_FILTER migration is skipped and
+  requires manual remediation; recorded to audit, does not abort the run),
+  `UNKNOWN`.
 - **Retryable vs terminal**: only `TRANSIENT_API_ERROR`-classified exceptions
   (timeouts, 429/503-style) get a bounded retry (configurable
   `max_retries`, default small, exponential backoff) at the gateway level;
@@ -1075,7 +1103,7 @@ actually worked (or the exact error that proved a variant does *not* work).
 | Create ABAC column-mask policy | `CREATE OR REPLACE POLICY name ON TABLE t COLUMN MASK fn TO`` `account users` `` FOR TABLES MATCH COLUMNS has_tag_value(key,value) AS alias ON COLUMN alias` (no `USING COLUMNS` for a 1-arg mask fn) | **CONFIRMED — executed live.** Same `MATCH COLUMNS`-is-mandatory finding as row filters. Also confirmed: adding a redundant `USING COLUMNS (alias)` for a 1-argument mask function FAILS with an argument-count mismatch (`requires 2 argument(s), but the referred function ... takes 1 argument(s)`) — the masked value is passed implicitly as arg 1. |
 | Governed tags are a hard prerequisite for ABAC policies | n/a | **CONFIRMED** both empirically and via docs ("Governed tags applied to target objects" is a listed *requirement* for creating row filter/column mask policies) |
 | Create a governed tag (account-level) | `CREATE GOVERNED TAG tag_key [DESCRIPTION desc] [VALUES (v1, v2, ...)]` | **CONFIRMED — executed live.** Requires account-level `CREATE` privilege (workspace/account admins have it by default — our workspace-admin token succeeded, in contrast to the earlier finding that this same token could *not* create resolvable account-level *groups*, §identity — these are separate privilege domains). Key-only tags (no `VALUES`) only permit key-presence assignment, **not** arbitrary values (confirmed: assigning a custom value to a key-only-declared tag causes policy creation to fail with `Invalid tag value ... for key ...`, even though `ALTER TABLE ... SET TAGS` itself accepts the write without complaint). |
-| Key-only tag + `has_tag(key)` (no value at all) | `ALTER TABLE t ALTER COLUMN c SET TAGS ('key')` (no `= value`) then `MATCH COLUMNS has_tag('key') AS alias` | **CONFIRMED — executed live (2026-08-26 spike).** Works exactly like `has_tag_value` when the key is unique-within-the-table. ⚠️ **Also confirmed the failure mode this must avoid**: tagging a 2nd column of the *same* table with the *same* key-only tag lets `CREATE OR REPLACE POLICY` succeed (no validation at creation time), but every subsequent `SELECT` on that table then fails with `[UC_ABAC_AMBIGUOUS_COLUMN_MATCH] ... Using alias 'mc_dept' had 2 matches, exactly 1 match is allowed` — i.e. this is a deferred, read-time failure, not a creation-time one. `tag_provisioner._split_by_collision()` exists specifically to detect and avoid this by only falling back to per-column unique values when 2+ columns of the same table would otherwise share a bare key. |
+| Key-only tag + `has_tag(key)` (no value at all) | `ALTER TABLE t ALTER COLUMN c SET TAGS ('key')` (no `= value`) then `MATCH COLUMNS has_tag('key') AS alias` | **CONFIRMED — executed live (2026-08-26 spike).** Works exactly like `has_tag_value` when the key is unique-within-the-table. ⚠️ **Also confirmed the failure mode this must avoid, for ROW_FILTER**: tagging a 2nd column of the *same* table with the *same* key-only tag lets `CREATE OR REPLACE POLICY` succeed (no validation at creation time), but every subsequent `SELECT` on that table then fails with `[UC_ABAC_AMBIGUOUS_COLUMN_MATCH] ... Using alias 'mc_dept' had 2 matches, exactly 1 match is allowed` — i.e. this is a deferred, read-time failure, not a creation-time one. **CONFIRMED live (2026-09-09 spike) that COLUMN_MASK does NOT have this failure mode** — sharing one key-only tag across 2 columns of the same table masks both independently with no ambiguity error at any point. `tag_provisioner._split_by_collision()` now uses this role split directly: masks always stay key-only regardless of collisions; ROW_FILTER collisions are skipped (no tag assigned, table's ROW_FILTER step fails with `RLS_TAG_COLLISION_UNRESOLVABLE`, recorded to audit) rather than falling back to a disambiguating value (that fallback existed briefly and was removed on request — no tag VALUE is minted by this tool anymore, for either role). |
 | Grow a governed tag's allowed values | `ALTER GOVERNED TAG tag_key SET VALUES (v1, v2, ..., vN)` | **CONFIRMED — executed live.** ⚠️ **Declarative full replace, not additive** — the given list replaces the entire allowed-values list (confirmed via docs: "Any previously defined values not included in the new list are removed"). Existing **tag assignments** on columns survive this (confirmed: re-queried `information_schema.column_tags` after growing the list, prior assignments intact) — only the *allowed-values catalog* is replaced, not the applied instances. This is a **race hazard under concurrency** (§7.4 point 3). |
 | Propagation delay after growing tag values | n/a (control-plane cache lag) | **CONFIRMED — executed live.** `CREATE POLICY` referencing a value added via `ALTER GOVERNED TAG ... SET VALUES` moments earlier fails for ~20-30s with `Invalid tag value ... for key ...` even though `DESCRIBE GOVERNED TAG` already reflects the new value immediately. Resolved on retry after the delay. Must be handled by the resilience layer (§10.1) as a bounded-window retryable condition. |
 | Tag a column | `ALTER TABLE t ALTER COLUMN c SET TAGS ('key' = 'value')` | **CONFIRMED — executed live** |
@@ -1185,12 +1213,11 @@ remains:
    earlier in this project, §identity) and should be explicitly checked in
    `pre_validation` rather than assumed, exactly like the account-group
    lesson learned earlier.
-5. **NEW: decide the exact synthetic tag value format** given the 256-char
-   governed-tag-value length limit (confirmed via docs) — e.g. use a short
-   hash of `<catalog>.<schema>.<table>.<column>` rather than the raw FQN, to
-   stay safely under the limit for deeply-nested/long-named objects, while
-   keeping the audit trail able to reverse-map hash → column (store the
-   mapping in the audit tables, §4, not derive it from the hash).
+5. ~~**NEW: decide the exact synthetic tag value format**~~ **RESOLVED/MOOT
+   (REVISED on request):** no tag VALUE is minted by this tool anymore, for
+   either role — see §7.4 point 2. A same-table ROW_FILTER collision that
+   would have needed a disambiguating value is now a graceful per-table
+   `RLS_TAG_COLLISION_UNRESOLVABLE` failure instead.
 
 ---
 

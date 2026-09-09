@@ -151,42 +151,61 @@ def test_single_column_per_table_stays_key_only_even_when_shared_across_tables()
     assert fake.governed_tags[RF_TAG_KEY].values == []
 
 
-def test_same_function_guarding_two_columns_of_the_same_table_gets_disambiguating_values():
+def test_same_function_guarding_two_columns_of_the_same_table_skips_both_for_row_filter():
     # A row filter function taking 2 USING COLUMNS from the SAME table is a
     # real same-table collision - has_tag(key) alone would be ambiguous
-    # (confirmed live: UC_ABAC_AMBIGUOUS_COLUMN_MATCH at query time), so
-    # BOTH columns must get their own unique value under the shared key.
+    # (confirmed live: UC_ABAC_AMBIGUOUS_COLUMN_MATCH at query time). No
+    # value is minted to disambiguate anymore (removed by design) - both
+    # columns are simply left unresolved so the caller (rls_to_abac.py)
+    # fails only this table's ROW_FILTER step instead of crashing the run.
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake)
+    req_a = TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)
+    req_b = TagRequest(table=table, column="region", role="row_filter", function_fqn=RF_FN)
+    resolved = provisioner.prepare([req_a, req_b], dry_run=False)
+
+    assert (table, "business_unit", "row_filter") not in resolved
+    assert (table, "region", "row_filter") not in resolved
+    # No column ever got the tag assigned, and the tag itself is never
+    # minted at all when every request for it collides.
+    assert RF_TAG_KEY not in fake.governed_tags
+    assert fake.column_tags.get(table.full_name, []) == []
+    assert {req_a, req_b} == set(provisioner.last_row_filter_collisions)
+
+
+def test_same_function_guarding_two_columns_of_the_same_table_stays_key_only_for_masks():
+    # The exact same shape of collision as above, but role="mask" - masks
+    # are confirmed safe to share one bare key-only tag across multiple
+    # columns of one table, so both should resolve normally with NO value.
     fake = FakeUnityCatalogGateway()
     table = TableRef("cat", "sch", "t1")
     fake.register_table(table)
 
     provisioner = TagProvisioner(fake)
     resolved = provisioner.prepare([
-        TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN),
-        TagRequest(table=table, column="region", role="row_filter", function_fqn=RF_FN),
+        TagRequest(table=table, column="ssn", role="mask", function_fqn=MASK_FN),
+        TagRequest(table=table, column="email", role="mask", function_fqn=MASK_FN),
     ], dry_run=False)
 
-    mc_a = resolved[(table, "business_unit", "row_filter")]
-    mc_b = resolved[(table, "region", "row_filter")]
-    assert mc_a.tag_value is not None and mc_b.tag_value is not None
-    assert mc_a.tag_value != mc_b.tag_value  # each column uniquely identified
-    assert {mc_a.tag_value, mc_b.tag_value} == set(fake.governed_tags[RF_TAG_KEY].values)
+    mc_a = resolved[(table, "ssn", "mask")]
+    mc_b = resolved[(table, "email", "mask")]
+    assert mc_a.tag_key == MASK_TAG_KEY and mc_b.tag_key == MASK_TAG_KEY
+    assert mc_a.tag_value is None and mc_b.tag_value is None
+    assert fake.governed_tags[MASK_TAG_KEY].values == []  # never gets any allowed values
+    assert not provisioner.last_row_filter_collisions
 
 
-def test_grows_existing_governed_tag_values_instead_of_overwriting():
+def test_row_filter_collision_with_other_tables_does_not_affect_them():
+    # table1 has the real collision (2 columns); table2's single column,
+    # same function, is completely unaffected and still resolves key-only.
     fake = FakeUnityCatalogGateway()
-    table1 = TableRef("cat", "sch", "t1")  # 2 columns -> real collision -> needs values
-    table2 = TableRef("cat", "sch", "t2")  # 1 column -> no collision -> stays key-only
+    table1 = TableRef("cat", "sch", "t1")
+    table2 = TableRef("cat", "sch", "t2")
     fake.register_table(table1)
     fake.register_table(table2)
-    # Simulates a prior run having already minted this exact key for RF_FN -
-    # description matches what this tool itself would have written, so the
-    # collision-safety check in _mint_and_assign recognizes it as "same
-    # function, safe to extend" rather than raising TagKeyCollisionError.
-    fake.register_governed_tag(
-        RF_TAG_KEY, values=["preexisting_value"],
-        description=SYNTHETIC_TAG_DESCRIPTION_TEMPLATE.format(function_fqn=RF_FN),
-    )
 
     provisioner = TagProvisioner(fake)
     resolved = provisioner.prepare([
@@ -195,12 +214,12 @@ def test_grows_existing_governed_tag_values_instead_of_overwriting():
         TagRequest(table=table2, column="dept", role="row_filter", function_fqn=RF_FN),
     ], dry_run=False)
 
-    final_values = set(fake.governed_tags[RF_TAG_KEY].values)
-    assert "preexisting_value" in final_values  # old value preserved, not clobbered
-    assert resolved[(table1, "business_unit", "row_filter")].tag_value in final_values
-    assert resolved[(table1, "region", "row_filter")].tag_value in final_values
-    assert len(final_values) == 3  # preexisting + the 2 colliding columns' new values
-    assert resolved[(table2, "dept", "row_filter")].tag_value is None  # no collision here
+    assert (table1, "business_unit", "row_filter") not in resolved
+    assert (table1, "region", "row_filter") not in resolved
+    mc = resolved[(table2, "dept", "row_filter")]
+    assert mc.tag_key == RF_TAG_KEY
+    assert mc.tag_value is None
+    assert fake.governed_tags[RF_TAG_KEY].values == []  # still no values, ever
 
 
 def test_prefer_existing_tags_false_always_mints():
@@ -285,13 +304,14 @@ def test_pre_existing_non_migration_tag_at_the_exact_deterministic_key_raises():
         )
 
 
-def test_new_column_colliding_with_a_pre_existing_key_only_assignment_gets_a_value():
+def test_new_column_colliding_with_a_pre_existing_key_only_assignment_is_skipped():
     # table already has ONE column key-only-tagged with RF_TAG_KEY from a
     # prior run (not reusable for a DIFFERENT column - _find_reusable_tag
     # only reuses a tag already on the SAME column). A second, different
     # column in the SAME table now also needs RF_FN's tag - this must NOT
-    # become key-only too (that would silently recreate the exact ambiguity
-    # this whole mechanism exists to avoid), so it must get a real value.
+    # become key-only too (that would recreate the exact ambiguity this
+    # whole mechanism exists to avoid), and no value is minted to
+    # disambiguate anymore, so it must simply be skipped/left unresolved.
     fake = FakeUnityCatalogGateway()
     table = TableRef("cat", "sch", "t1")
     fake.register_table(table)
@@ -301,14 +321,12 @@ def test_new_column_colliding_with_a_pre_existing_key_only_assignment_gets_a_val
     fake.add_column_tag(table, "business_unit", RF_TAG_KEY, None)  # pre-existing key-only assignment
 
     provisioner = TagProvisioner(fake)
-    resolved = provisioner.prepare(
-        [TagRequest(table=table, column="region", role="row_filter", function_fqn=RF_FN)], dry_run=False,
-    )
+    req = TagRequest(table=table, column="region", role="row_filter", function_fqn=RF_FN)
+    resolved = provisioner.prepare([req], dry_run=False)
 
-    mc = resolved[(table, "region", "row_filter")]
-    assert mc.tag_key == RF_TAG_KEY
-    assert mc.tag_value is not None
-    assert mc.tag_value in fake.governed_tags[RF_TAG_KEY].values
+    assert (table, "region", "row_filter") not in resolved
+    assert fake.governed_tags[RF_TAG_KEY].values == []  # still no values, ever
+    assert provisioner.last_row_filter_collisions == [req]
 
 
 # ---------------------------------------------------------------------------

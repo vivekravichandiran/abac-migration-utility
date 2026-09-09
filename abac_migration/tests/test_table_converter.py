@@ -488,3 +488,53 @@ def test_finalize_rerun_after_success_reports_already_migrated():
     second_finalize = convert_table(table, fake, dry_run=False, phase="FINALIZE")
 
     assert second_finalize.status == StepStatus.ALREADY_MIGRATED
+
+
+# ---------------------------------------------------------------------------
+# No-value tagging: masks always key-only; row-filter same-table collisions
+# fail gracefully (recorded in the audit trail, run continues) instead of
+# minting a disambiguating tag VALUE. See tag_provisioner.py module docstring.
+# ---------------------------------------------------------------------------
+
+def test_scenario_16_row_filter_multi_column_same_table_collision_fails_gracefully():
+    # A row filter function taking 2 columns FROM THE SAME TABLE is a real
+    # same-table tag collision (both columns would need the identical bare
+    # tag key) - this must FAIL just the ROW_FILTER step with a clear,
+    # dedicated error code, not crash convert_table() or silently mint a
+    # disambiguating value.
+    fake = FakeUnityCatalogGateway()
+    table = _table()
+    fake.set_row_filter_state(table, RF_FN, ["business_unit", "region"])
+    fake.set_column_mask_state(table, "email", MASK_FN_1)  # unaffected sibling object
+
+    result = convert_table(table, fake, dry_run=False)
+
+    assert result.rls_status == StepStatus.FAILED
+    assert result.step_results[0].error_code == "RLS_TAG_COLLISION_UNRESOLVABLE"
+    assert result.column_mask_status == {"email": StepStatus.SUCCESS}  # sibling mask still succeeds
+    assert result.status == StepStatus.FAILED  # weakest-link
+    # No tag was ever assigned for the colliding row-filter columns, and
+    # the legacy row filter is left untouched (never dropped without a
+    # verified ABAC replacement).
+    assert fake.row_filters[table.full_name] is not None
+    assert not any(t.column in ("business_unit", "region") for t in fake.column_tags[table.full_name])
+
+
+def test_scenario_17_mask_shared_by_two_columns_of_same_table_stays_key_only_and_succeeds():
+    # The SAME mask function reused across 2 columns of ONE table -
+    # confirmed live safe for COLUMN_MASK - must succeed fully for both
+    # columns with a shared, bare (no-value) governed tag.
+    fake = FakeUnityCatalogGateway()
+    table = _table()
+    fake.set_column_mask_state(table, "ssn", MASK_FN_3)
+    fake.set_column_mask_state(table, "national_id", MASK_FN_3)  # same function, 2nd column
+
+    result = convert_table(table, fake, dry_run=False)
+
+    assert result.status == StepStatus.SUCCESS
+    assert result.column_mask_status == {"ssn": StepStatus.SUCCESS, "national_id": StepStatus.SUCCESS}
+    shared_tags = [t for t in fake.column_tags[table.full_name] if t.column in ("ssn", "national_id")]
+    assert len(shared_tags) == 2
+    assert shared_tags[0].tag_key == shared_tags[1].tag_key  # one shared key
+    assert shared_tags[0].tag_value is None and shared_tags[1].tag_value is None  # no value, ever
+    assert fake.governed_tags[shared_tags[0].tag_key].values == []

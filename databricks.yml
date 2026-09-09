@@ -175,3 +175,7 @@ targets:
       # The whole reason this target exists: exercise catalog level
       # application end to end instead of the table-level default.
       policy_scope: "CATALOG"
+      # Namespaces every governed tag key + (since policy_scope=CATALOG)
+      # ABAC policy name this target's jobs mint - see the top-level
+      # tag_team_prefix variable description above.
+      tag_team_prefix: "mobility"

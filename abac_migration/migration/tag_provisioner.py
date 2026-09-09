@@ -4,18 +4,35 @@ governed tags, so every column referenced by a legacy row filter or column
 mask needs a governed tag that identifies it within its own table before a
 CREATE POLICY statement can be built.
 
-Value is OPTIONAL, only added when actually needed for disambiguation. A
-plain key-only tag (`CREATE GOVERNED TAG key`, no `VALUES`) plus
-`MATCH COLUMNS has_tag(key)` is sufficient - and preferred, since it needs
-no "Allowed values" entry at all - whenever that key will only ever land on
-ONE column per table. A per-column-unique VALUE (`has_tag_value(key,
-value)`) is only minted when it's actually required: confirmed live that
-`has_tag(key)` compiles fine at `CREATE POLICY` time even when two columns
-in the SAME table share that key, but then fails on every read with
-`UC_ABAC_AMBIGUOUS_COLUMN_MATCH: ... had 2 matches, exactly 1 match is
-allowed` - see `_split_by_collision()`. This only happens when the same
-legacy function guards more than one column of the same table (rare, but
-real - e.g. a generic reusable mask function applied to two columns).
+**No tag VALUE is ever minted by this tool, for either role** (confirmed
+requirement - governed tags stay bare keys, `CREATE GOVERNED TAG key` with
+no `VALUES`, everywhere `MATCH COLUMNS has_tag(key)`). This used to be
+"optional, only when needed for disambiguation" with a per-column unique
+`has_tag_value(key, value)` fallback whenever the same legacy function
+guarded 2+ columns of one table (confirmed live: `has_tag(key)` compiles
+fine at `CREATE POLICY` time even when two columns in the SAME table share
+that key, but then fails on every read with `UC_ABAC_AMBIGUOUS_COLUMN_MATCH:
+... had 2 matches, exactly 1 match is allowed`) - that fallback has been
+REMOVED. The two roles now diverge instead:
+
+- **COLUMN_MASK** (`role="mask"`): confirmed live that sharing one bare
+  key-only tag across multiple columns of the same table is completely
+  safe - `has_tag(key)` resolves independently per column at mask-
+  application time, no ambiguity error at all. So masks ALWAYS get a
+  key-only tag, unconditionally, regardless of how many columns of a table
+  share the underlying function's tag key.
+- **ROW_FILTER** (`role="row_filter"`): the ambiguity risk above is real
+  and UC only allows a single active row filter per table anyway, so two
+  columns of one table genuinely needing the identical RLS tag key is not
+  a supportable configuration for this tool. Rather than inventing a value
+  to disambiguate, `_split_by_collision()` now simply SKIPS assigning a
+  tag to those columns altogether - they are left out of `prepare()`'s
+  returned `resolved` dict. `rls_to_abac.py`'s `_build_match_columns_or_fail`
+  then fails ONLY that table's ROW_FILTER step
+  (`RLS_TAG_COLLISION_UNRESOLVABLE`), which is recorded to `migration_audit`
+  like any other per-object failure - the run is NOT aborted and every
+  other table (including this table's column masks) proceeds normally.
+  See DESIGN.md §7.4 point 2b.
 
 Tag KEY granularity: one governed tag key per distinct legacy SQL function,
 named `abac_<rls|colmask>_[<team_prefix>_]<catalog>_<schema>_<function_name>`
@@ -67,7 +84,6 @@ confirmed declarative/full-replace, not additive).
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -201,18 +217,6 @@ def tag_key_for_function(
     return f"abac_{role_abbrev}_{sanitized}"
 
 
-def _synthetic_value_for(request: TagRequest) -> str:
-    # 256-char governed-tag-value limit (confirmed via docs, §16 item 5) -
-    # a fixed-length hash comfortably stays under it regardless of how long
-    # catalog/schema/table/column names are; the audit trail stores the
-    # real column name directly (§4), so no hash->column reverse-mapping is
-    # ever needed off of the tag value itself. (Unrelated to the tag KEY
-    # naming scheme above, which never uses a hash - this is a per-column
-    # disambiguating VALUE under an already-human-readable key.)
-    raw = f"{request.table.full_name}.{request.column}.{request.role}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
 class TagProvisioner:
     def __init__(self, uc: UnityCatalogGateway, prefer_existing_tags: bool = True, team_prefix: str = ""):
         self._uc = uc
@@ -223,11 +227,26 @@ class TagProvisioner:
         # matches on whatever key is already assigned to the column, whatever
         # prefix it was minted with).
         self._team_prefix = team_prefix
+        # Introspection-only (see prepare() docstring) - re-populated fresh
+        # on every prepare() call, never accumulated across calls.
+        self.last_row_filter_collisions: list = []
 
     def prepare(self, requests: list, dry_run: bool = False) -> dict:
-        """Resolves every TagRequest to a MatchColumn, minting/growing
-        governed tags in as few serialized calls as possible. Returns
-        {(table, column, role): MatchColumn}."""
+        """Resolves every TagRequest to a MatchColumn, minting governed tags
+        in as few serialized calls as possible. Returns
+        {(table, column, role): MatchColumn} - deliberately NOT guaranteed
+        to contain an entry for every input request: a `role="row_filter"`
+        request whose table has 2+ columns competing for the same tag key
+        is intentionally left out (see module docstring / `_split_by_collision`)
+        rather than given a disambiguating value. Callers must treat a
+        missing `(table, column, role)` key as "this column's ROW_FILTER
+        tag could not be safely assigned" - `rls_to_abac.py` already does
+        this (`_build_match_columns_or_fail` -> per-table FAILED step, not
+        a crash). Also populates `self.last_row_filter_collisions` (list of
+        skipped TagRequests from this call, reset on every `prepare()` call)
+        purely for introspection/testing - not consulted by any production
+        code path."""
+        self.last_row_filter_collisions: list = []
         if not requests:
             return {}
 
@@ -309,61 +328,58 @@ class TagProvisioner:
 
         for tag_key, reqs in by_key.items():
             existing_def = governed_tags.get(tag_key)
-            key_only_reqs, valued_reqs = self._split_by_collision(tag_key, reqs, table_tags_cache)
-            new_values = {_synthetic_value_for(r): r for r in valued_reqs}
+            key_only_reqs, skipped_reqs = self._split_by_collision(tag_key, reqs, table_tags_cache)
+            self.last_row_filter_collisions.extend(skipped_reqs)
 
-            if new_values:
-                if existing_def is None:
-                    self._uc.create_governed_tag(
-                        tag_key, values=list(new_values.keys()),
-                        description=SYNTHETIC_TAG_DESCRIPTION_TEMPLATE.format(function_fqn=reqs[0].function_fqn),
-                        dry_run=dry_run,
-                    )
-                else:
-                    union_values = sorted(set(existing_def.values) | set(new_values.keys()))
-                    self._uc.alter_governed_tag_set_values(tag_key, union_values, dry_run=dry_run)
-            elif existing_def is None:
-                # No column needs disambiguation - a plain key-only governed
-                # tag (no allowed values) is sufficient; every column will
-                # be matched via has_tag(key) instead of has_tag_value().
+            if key_only_reqs and existing_def is None:
+                # A plain key-only governed tag (no allowed values, ever -
+                # see module docstring) - every column is matched via
+                # has_tag(key), never has_tag_value(key, value).
                 self._uc.create_governed_tag(
                     tag_key, values=[],
                     description=SYNTHETIC_TAG_DESCRIPTION_TEMPLATE.format(function_fqn=reqs[0].function_fqn),
                     dry_run=dry_run,
                 )
 
-            for value, req in new_values.items():
-                self._uc.set_column_tags(req.table, req.column, {tag_key: value}, dry_run=dry_run)
-                resolved[(req.table, req.column, req.role)] = MatchColumn(
-                    tag_key=tag_key, tag_value=value, alias=_alias_for(req.column), source_column=req.column,
-                )
             for req in key_only_reqs:
                 self._uc.set_column_tags(req.table, req.column, {tag_key: None}, dry_run=dry_run)
                 resolved[(req.table, req.column, req.role)] = MatchColumn(
                     tag_key=tag_key, tag_value=None, alias=_alias_for(req.column), source_column=req.column,
                 )
+            # skipped_reqs: deliberately NOT assigned a tag and NOT added to
+            # `resolved` - see _split_by_collision docstring below.
 
     @staticmethod
     def _split_by_collision(tag_key: str, reqs: list, table_tags_cache: dict) -> tuple:
-        """A column only needs its own unique tag VALUE (and hence an
-        allowed-values entry) when `has_tag(tag_key)` alone would be
-        ambiguous within that column's table - i.e. some OTHER column in
-        the same table already carries (or, in this very batch, will also
-        carry) this exact key (confirmed live: two same-keyed columns +
-        `has_tag(key)` compiles fine at CREATE POLICY time but fails every
-        query with UC_ABAC_AMBIGUOUS_COLUMN_MATCH). Otherwise a plain
-        key-only tag is preferred - it needs no allowed-value entry at all,
-        avoiding "Allowed values" clutter for the overwhelmingly common
-        one-column-per-table case. Returns (key_only_reqs, valued_reqs)."""
+        """Detects, per table, whether 2+ columns would end up sharing the
+        same bare `tag_key` - i.e. some OTHER column in the same table
+        already carries (or, in this very batch, will also carry) this
+        exact key. What happens next now depends entirely on the role
+        (module docstring):
+
+        - `role="mask"`: always returned as key-only, collision or not -
+          confirmed live that COLUMN_MASK has no ambiguity risk from
+          sharing one key-only tag across a table's columns.
+        - `role="row_filter"`: a real collision (2+ requests for this key
+          on one table, or a pre-existing column already carrying it) means
+          `has_tag(key)` would compile at `CREATE POLICY` time but fail
+          every subsequent `SELECT` with `UC_ABAC_AMBIGUOUS_COLUMN_MATCH`.
+          No value is minted to disambiguate (removed - see module
+          docstring); the request is SKIPPED entirely instead (returned in
+          the second tuple element) - no tag assigned, left out of
+          `prepare()`'s `resolved` dict on purpose.
+
+        Returns (key_only_reqs, skipped_reqs)."""
         reqs_by_table: dict = {}
         for r in reqs:
             reqs_by_table.setdefault(r.table, []).append(r)
 
-        key_only, valued = [], []
+        key_only, skipped = [], []
         for table, table_reqs in reqs_by_table.items():
             pre_existing_same_key = any(t.tag_key == tag_key for t in table_tags_cache.get(table, []))
-            if len(table_reqs) > 1 or pre_existing_same_key:
-                valued.extend(table_reqs)
-            else:
+            collision = len(table_reqs) > 1 or pre_existing_same_key
+            if not collision or table_reqs[0].role == "mask":
                 key_only.extend(table_reqs)
-        return key_only, valued
+            else:
+                skipped.extend(table_reqs)
+        return key_only, skipped

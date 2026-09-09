@@ -157,10 +157,33 @@ class RLSMigrationPlugin:
         for col in obj.source_using_columns:
             mc = options.resolved_match_columns.get((table, col, "row_filter"))
             if mc is None:
+                # By far the most common cause (tag_provisioner.py's
+                # TagProvisioner never mints a disambiguating VALUE anymore):
+                # this table has 2+ columns that would compete for the exact
+                # same bare governed-tag key, which UC would only reject at
+                # SELECT time with UC_ABAC_AMBIGUOUS_COLUMN_MATCH rather than
+                # at CREATE POLICY time - so the tag layer deliberately
+                # skipped assigning a tag here instead of silently building
+                # a policy that's certain to break on every read. This is a
+                # per-table FAILED step, recorded to migration_audit like any
+                # other - it does NOT abort the run; every other table (and
+                # this table's column masks, which have no such restriction)
+                # proceeds normally. Manual remediation (e.g. splitting the
+                # shared row-filter function so each table's row filter only
+                # ever needs one governed tag) is required for this table.
                 return None, ConversionStepResult(
                     object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
-                    error_code="TAG_RESOLUTION_MISSING",
-                    error_message=f"No resolved governed tag for row-filter column {col!r}",
+                    error_code="RLS_TAG_COLLISION_UNRESOLVABLE",
+                    error_message=(
+                        f"Could not safely assign a governed tag to row-filter column {col!r} of "
+                        f"{table.full_name} - another column of this same table already needs (or "
+                        "would need) the identical bare tag key for this function, and Unity "
+                        "Catalog only allows a MATCH COLUMNS has_tag(key) alias to resolve to "
+                        "exactly one physical column per table (confirmed: otherwise every SELECT "
+                        "fails with UC_ABAC_AMBIGUOUS_COLUMN_MATCH). This tool no longer mints a "
+                        "disambiguating tag VALUE to work around this, so this table's ROW_FILTER "
+                        "migration was skipped - manual remediation required."
+                    ),
                 )
             match_columns.append(mc)
         return match_columns, None

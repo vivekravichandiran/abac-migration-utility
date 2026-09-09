@@ -254,7 +254,7 @@ persisted to `migration_audit` (`migration_phase` =
 `ROLLBACK` wrote nothing to the audit table at all. See
 `abac_migration/DESIGN.md` §8.1 and `tests/test_rollback_resilience.py`.
 
-## Governed tags: one tag key per legacy function
+## Governed tags: one tag key per legacy function, NO tag values ever
 
 `tag_provisioner.py` mints one governed tag **key** per distinct legacy SQL
 function (row-filter or mask function), derived deterministically from its
@@ -264,9 +264,24 @@ used just two shared keys (`abac_rls` / `abac_colmask`) for every row
 filter / mask account-wide. Per-function keys mean `SHOW GOVERNED TAGS` /
 `DESCRIBE GOVERNED TAG` on any one key maps 1:1 back to the specific legacy
 function that used to enforce that security, at the cost of many more tag
-keys for a large migration. Tag *values* are still minted per
-(table, column) — unique within a table, as required for `MATCH COLUMNS` to
-unambiguously target one column (`abac_migration/DESIGN.md` §7.4).
+keys for a large migration.
+
+**No tag value is ever minted, for either role** (governed tags stay bare
+keys — `CREATE GOVERNED TAG key`, no `VALUES`, no "Allowed values" list).
+The two roles diverge in how a same-table collision (2+ columns of one
+table needing the identical key) is handled, confirmed by live testing:
+- **Column masks**: safe to share one key-only tag across multiple columns
+  of the same table — each column is masked independently, no ambiguity.
+- **Row filters**: Unity Catalog requires each `MATCH COLUMNS has_tag(key)`
+  alias to resolve to exactly one physical column per table, so a genuine
+  collision (e.g. a row filter function with 2+ `USING COLUMNS` from the
+  same table) is **not disambiguated with a value** — instead, the tool
+  skips assigning a tag to those columns and fails just that table's
+  `ROW_FILTER` step with `error_code=RLS_TAG_COLLISION_UNRESOLVABLE`,
+  recorded to `migration_audit`. This does **not** abort the run — every
+  other table (and that table's column masks) proceeds normally; manual
+  remediation is required for the affected table. See
+  `abac_migration/DESIGN.md` §7.4 point 2.
 
 ## LLM-assisted PII tagging (INVENTORY-only)
 
