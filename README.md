@@ -84,7 +84,12 @@ from the table's discovered `table_type` and picks the right DDL keyword
 automatically (`gateway.py`'s `_alter_keyword_for()`), so no configuration
 is needed to migrate a materialized view; it just works like any other
 supported table type. See `DESIGN.md` §16 item 2 for the full history
-(Track A = `STREAMING_TABLE`, Track B = `MATERIALIZED_VIEW`).
+(Track A = `STREAMING_TABLE`, Track B = `MATERIALIZED_VIEW`), and
+`FULL_REGRESSION_TEST_CASES.md` for the combined regression proof that all
+3 table types (`MANAGED`/`STREAMING_TABLE`/`MATERIALIZED_VIEW`) x all 3
+security flavors (RLS-only/mask-only/both) work correctly side by side in
+one catalog, across every mode (`INVENTORY`/`APPLY_ABAC`/`FINALIZE`/
+`ROLLBACK`).
 
 ### `MIGRATE` / `INVENTORY_AND_MIGRATE`
 

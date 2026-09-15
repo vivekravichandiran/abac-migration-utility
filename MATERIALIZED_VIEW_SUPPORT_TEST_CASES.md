@@ -1,5 +1,11 @@
 # Test Case Document — MATERIALIZED_VIEW Eligibility & Full-Lifecycle Support
 
+> **See also:** `FULL_REGRESSION_TEST_CASES.md` for the master regression
+> document that proves `MATERIALIZED_VIEW` continues to work correctly
+> *together* with `MANAGED` and `STREAMING_TABLE` (side by side, in one
+> catalog, across `INVENTORY`/`APPLY_ABAC`/`FINALIZE`/`ROLLBACK`) — this
+> document only covers `MATERIALIZED_VIEW` in isolation, as first implemented.
+
 **Feature under test:** ABAC Migration Utility support for `MATERIALIZED_VIEW`
 objects (Track B of the streaming-tables ABAC plan — `STREAMING_TABLE`
 support was Track A, see `STREAMING_TABLE_SUPPORT_TEST_CASES.md` and

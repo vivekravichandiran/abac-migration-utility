@@ -1,5 +1,11 @@
 # Test Case Document — STREAMING_TABLE Eligibility & Full-Lifecycle Support
 
+> **See also:** `FULL_REGRESSION_TEST_CASES.md` for the master regression
+> document that proves `STREAMING_TABLE` continues to work correctly
+> *together* with `MANAGED` and `MATERIALIZED_VIEW` (side by side, in one
+> catalog, across `INVENTORY`/`APPLY_ABAC`/`FINALIZE`/`ROLLBACK`) — this
+> document only covers `STREAMING_TABLE` in isolation, as first implemented.
+
 **Feature under test:** ABAC Migration Utility support for `STREAMING_TABLE`
 objects (Track A of the streaming-tables ABAC plan; `MATERIALIZED_VIEW`
 support is Track B, tracked separately and **not** in scope for this

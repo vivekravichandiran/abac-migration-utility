@@ -1235,6 +1235,16 @@ remains:
    with correct enforcement (row filter + mask) verified via live `SELECT`
    at each phase, and correct `ALTER MATERIALIZED VIEW ... DROP` legacy
    removal at FINALIZE.
+   **Full regression (2026-09-15, `FULL_REGRESSION_TEST_CASES.md`):** after
+   both tracks shipped, a combined regression pass ran `MANAGED` +
+   `STREAMING_TABLE` + `MATERIALIZED_VIEW` (3 table types) x RLS-only/
+   mask-only/both (3 flavors) = 9 tables side by side in one catalog
+   through `INVENTORY -> APPLY_ABAC -> FINALIZE`, then `ROLLBACK` of all 9,
+   then a full idempotent re-migration - 9/9 tables passed at every stage,
+   0 defects found. See `STREAMING_TABLE_SUPPORT_TEST_CASES.md` and
+   `MATERIALIZED_VIEW_SUPPORT_TEST_CASES.md` for each track's individual
+   implementation/test record, and `FULL_REGRESSION_TEST_CASES.md` for the
+   combined regression detail.
 3. **NEW (discovered during §17 spike): decide the exact reuse-vs-mint
    heuristic for governed tags** (§7.4 point 1) — e.g. should the utility
    ever trust a pre-existing `class.email_address`-style tag as sufficient
