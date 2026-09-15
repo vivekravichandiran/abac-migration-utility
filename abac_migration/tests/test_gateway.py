@@ -188,3 +188,127 @@ def test_build_create_policy_statement_multiple_except_principals():
     )
 
     assert "EXCEPT `etl_service_principal`, `break_glass_admins`\n" in stmt
+
+
+# ---------------------------------------------------------------------------
+# MATERIALIZED_VIEW support (Track B, 2026-09-15):
+# 1. describe_table_security()'s column-mask parser must not mis-read a
+#    materialized view's trailing "Total Size (bytes)" administrative row
+#    (which sits directly under "# Column Masks" with no separator) as a
+#    phantom masked column - confirmed live, DEF-01 in
+#    STREAMING_TABLE_SUPPORT_TEST_CASES.md.
+# 2. The 5 table_type-aware mutating methods must emit `ALTER MATERIALIZED
+#    VIEW ...` (not `ALTER TABLE ...`) whenever table_type=="MATERIALIZED_VIEW",
+#    and keep emitting plain `ALTER TABLE ...` for every other table_type
+#    (default "MANAGED", and explicitly STREAMING_TABLE too - confirmed live
+#    it does NOT need the ALTER STREAMING TABLE keyword, unlike MVs).
+# ---------------------------------------------------------------------------
+
+def test_describe_table_security_mv_no_masks_does_not_pick_up_phantom_column():
+    """Real DESCRIBE TABLE EXTENDED output for a masked-column-free
+    MATERIALIZED_VIEW still includes a `# Column Masks` header (UC always
+    emits it) immediately followed by `Total Size (bytes)` - with the old
+    (blank/`#`-prefix-only) loop terminator this was mis-parsed as ONE
+    phantom masked column named "Total Size (bytes)" with function "2137"."""
+    executor = _StubExecutor(rows=[
+        ["Type", "MATERIALIZED_VIEW"],
+        ["# Column Masks", ""],
+        ["Total Size (bytes)", "2137"],
+        ["Num Files", "1"],
+    ])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    state = gateway.describe_table_security(TableRef("cat", "sch", "an_mv"))
+
+    assert state.table_type == "MATERIALIZED_VIEW"
+    assert state.column_masks == []
+    assert not state.has_column_masks
+
+
+def test_describe_table_security_mv_real_mask_still_parses_correctly():
+    """The same fix must not regress a MATERIALIZED_VIEW that DOES have a
+    real mask - its function FQN field is always backtick-quoted, unlike
+    the phantom "Total Size (bytes)" row's plain numeric field."""
+    executor = _StubExecutor(rows=[
+        ["Type", "MATERIALIZED_VIEW"],
+        ["# Column Masks", ""],
+        ["ssn", "`cat`.`sch`.`mask_ssn`"],
+        ["Total Size (bytes)", "2137"],
+    ])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    state = gateway.describe_table_security(TableRef("cat", "sch", "an_mv"))
+
+    assert len(state.column_masks) == 1
+    assert state.column_masks[0].column == "ssn"
+    assert state.column_masks[0].function_fqn == "cat.sch.mask_ssn"
+
+
+def test_drop_row_filter_uses_alter_table_by_default():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.drop_row_filter(TableRef("cat", "sch", "t1"), dry_run=False)
+
+    assert executor.statements == ["ALTER TABLE `cat`.`sch`.`t1` DROP ROW FILTER"]
+
+
+def test_drop_row_filter_uses_alter_table_for_streaming_table():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.drop_row_filter(TableRef("cat", "sch", "t1"), dry_run=False, table_type="STREAMING_TABLE")
+
+    assert executor.statements == ["ALTER TABLE `cat`.`sch`.`t1` DROP ROW FILTER"]
+
+
+def test_drop_row_filter_uses_alter_materialized_view():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.drop_row_filter(TableRef("cat", "sch", "t1"), dry_run=False, table_type="MATERIALIZED_VIEW")
+
+    assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` DROP ROW FILTER"]
+
+
+def test_drop_column_mask_uses_alter_materialized_view():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.drop_column_mask(TableRef("cat", "sch", "t1"), "ssn", dry_run=False, table_type="MATERIALIZED_VIEW")
+
+    assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` ALTER COLUMN `ssn` DROP MASK"]
+
+
+def test_set_row_filter_uses_alter_materialized_view():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.set_row_filter(
+        TableRef("cat", "sch", "t1"), "cat.sch.rf_dept", ["department"], dry_run=False, table_type="MATERIALIZED_VIEW",
+    )
+
+    assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` SET ROW FILTER cat.sch.rf_dept ON (`department`)"]
+
+
+def test_set_column_mask_uses_alter_materialized_view():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.set_column_mask(
+        TableRef("cat", "sch", "t1"), "ssn", "cat.sch.mask_ssn", dry_run=False, table_type="MATERIALIZED_VIEW",
+    )
+
+    assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` ALTER COLUMN `ssn` SET MASK cat.sch.mask_ssn"]
+
+
+def test_set_column_tags_uses_alter_materialized_view():
+    executor = _StubExecutor(rows=[])
+    gateway = DatabricksUnityCatalogGateway(executor)
+
+    gateway.set_column_tags(
+        TableRef("cat", "sch", "t1"), "ssn", {"abac_rls_cat_sch_rf_dept": None}, dry_run=False,
+        table_type="MATERIALIZED_VIEW",
+    )
+
+    assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` ALTER COLUMN `ssn` SET TAGS ('abac_rls_cat_sch_rf_dept')"]

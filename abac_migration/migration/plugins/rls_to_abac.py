@@ -49,6 +49,8 @@ class RLSMigrationPlugin:
 
         rf = discovery.security_state.row_filter if discovery.security_state else None
 
+        table_type = discovery.security_state.table_type if discovery.security_state else "MANAGED"
+
         if rf is None:
             # applicable purely because a matching ABAC policy already
             # exists and the legacy row filter is already gone (§7).
@@ -57,22 +59,25 @@ class RLSMigrationPlugin:
                 return ValidationResult(planned_objects=[PlannedObject(
                     masked_column=None, source_function=existing_def.function_fqn,
                     source_using_columns=[], tag_requests=[], decision="ALREADY_MIGRATED",
-                    existing_policy_name=existing_def.name,
+                    existing_policy_name=existing_def.name, table_type=table_type,
                 )])
             return ValidationResult(planned_objects=[PlannedObject(
                 masked_column=None, source_function="", source_using_columns=[],
                 tag_requests=[], decision="NOT_ELIGIBLE", reason_code="NO_LEGACY_SECURITY_FOUND",
+                table_type=table_type,
             )])
 
         if not uc.function_exists(rf.function_fqn):
             return ValidationResult(planned_objects=[PlannedObject(
                 masked_column=None, source_function=rf.function_fqn, source_using_columns=rf.using_columns,
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_FOUND",
+                table_type=table_type,
             )])
         if not uc.can_execute_function(rf.function_fqn):
             return ValidationResult(planned_objects=[PlannedObject(
                 masked_column=None, source_function=rf.function_fqn, source_using_columns=rf.using_columns,
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_ACCESSIBLE",
+                table_type=table_type,
             )])
 
         deterministic_name = self._policy_strategy.row_filter_policy_name(rf.function_fqn)
@@ -107,17 +112,18 @@ class RLSMigrationPlugin:
                 return ValidationResult(planned_objects=[PlannedObject(
                     masked_column=None, source_function=rf.function_fqn, source_using_columns=rf.using_columns,
                     tag_requests=[], decision="NOT_ELIGIBLE", reason_code="EXISTING_ABAC_POLICY_CONFLICT",
-                    existing_policy_name=deterministic_name,
+                    existing_policy_name=deterministic_name, table_type=table_type,
                 )])
             abac_already_applied = existing_def is not None
 
         tag_reqs = [
-            TagRequest(table=table, column=c, role="row_filter", function_fqn=rf.function_fqn)
+            TagRequest(table=table, column=c, role="row_filter", function_fqn=rf.function_fqn, table_type=table_type)
             for c in rf.using_columns
         ]
         return ValidationResult(planned_objects=[PlannedObject(
             masked_column=None, source_function=rf.function_fqn, source_using_columns=rf.using_columns,
             tag_requests=tag_reqs, decision="PROCEED", abac_already_applied=abac_already_applied,
+            table_type=table_type,
         )])
 
     def tag_requests(self, table: TableRef, validation: ValidationResult) -> list:
@@ -273,7 +279,7 @@ class RLSMigrationPlugin:
             )
 
         try:
-            uc.drop_row_filter(table, dry_run=False)
+            uc.drop_row_filter(table, dry_run=False, table_type=options.table_type)
         except Exception as exc:  # noqa: BLE001
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
@@ -332,7 +338,7 @@ class RLSMigrationPlugin:
             )
 
         try:
-            uc.drop_row_filter(table, dry_run=False)
+            uc.drop_row_filter(table, dry_run=False, table_type=options.table_type)
         except Exception as exc:  # noqa: BLE001 - converted into a taxonomy'd failure, never bubbled raw
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, source_function=obj.source_function,
@@ -414,5 +420,10 @@ class RLSMigrationPlugin:
             )]
 
         status = StepStatus.WOULD_ROLLBACK if dry_run else StepStatus.ROLLED_BACK
-        uc.set_row_filter(table, original["function"], original["using_columns"], dry_run=dry_run)
+        # rollback() has no ConvertOptions/PlannedObject to read table_type
+        # from (it's invoked standalone, long after the original run) - a
+        # fresh describe_table_security() is the simplest reliable source,
+        # and cheap relative to the rest of a rollback.
+        table_type = uc.describe_table_security(table).table_type
+        uc.set_row_filter(table, original["function"], original["using_columns"], dry_run=dry_run, table_type=table_type)
         return [ConversionStepResult(object_type=self.object_type, status=status, source_function=original["function"])]

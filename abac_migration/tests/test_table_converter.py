@@ -562,3 +562,70 @@ def test_scenario_18_streaming_table_full_migrate_succeeds():
     assert fake.column_masks[table.full_name] == {}
     assert "abac_migrated_row_filter" in fake.policies[table.full_name]
     assert fake.tables[table.full_name] == "STREAMING_TABLE"
+
+
+# 19 - MATERIALIZED_VIEW with RLS + a mask, phase="FULL" - Track B (2026-09-15):
+# unlike STREAMING_TABLE (scenario 18), a real MATERIALIZED_VIEW needs
+# `ALTER MATERIALIZED VIEW ...` instead of plain `ALTER TABLE ...` for every
+# mutating DDL statement (confirmed live: EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE
+# otherwise). This asserts both that the migration still succeeds AND that
+# every one of the 4 table_type-aware gateway calls this scenario touches
+# (drop_row_filter, drop_column_mask, and set_column_tags x2 for the RLS +
+# mask governed tags) was made with table_type="MATERIALIZED_VIEW" - i.e.
+# the real gateway would have chosen ALTER MATERIALIZED VIEW for every one.
+def test_scenario_19_materialized_view_full_migrate_uses_alter_mv_ddl():
+    fake = FakeUnityCatalogGateway()
+    table = _table("events_mv")
+    fake.set_row_filter_state(table, RF_FN, ["business_unit"])
+    fake.set_column_mask_state(table, "email", MASK_FN_1)
+    fake.tables[table.full_name] = "MATERIALIZED_VIEW"  # set_*_state calls register_table(MANAGED) internally
+
+    result = convert_table(table, fake, dry_run=False)
+
+    assert result.rls_status == StepStatus.SUCCESS
+    assert result.column_mask_status == {"email": StepStatus.SUCCESS}
+    assert result.status == StepStatus.SUCCESS
+    assert fake.row_filters[table.full_name] is None
+    assert fake.column_masks[table.full_name] == {}
+    assert "abac_migrated_row_filter" in fake.policies[table.full_name]
+    assert fake.tables[table.full_name] == "MATERIALIZED_VIEW"
+
+    # Every table_type-aware DDL call this run made must have been told
+    # table_type="MATERIALIZED_VIEW" - none should have silently defaulted
+    # back to "MANAGED" (which would mean the real gateway emitted the wrong,
+    # guaranteed-to-fail ALTER TABLE keyword).
+    assert fake.ddl_calls_with_table_type, "expected at least one table_type-aware DDL call"
+    assert all(call[2] == "MATERIALIZED_VIEW" for call in fake.ddl_calls_with_table_type)
+    ops_seen = {call[0] for call in fake.ddl_calls_with_table_type}
+    assert ops_seen == {"set_column_tags", "drop_row_filter", "drop_column_mask"}
+
+
+# 20 - MATERIALIZED_VIEW rollback also uses ALTER MATERIALIZED VIEW DDL -
+# rollback() has no ConvertOptions to read table_type from (it runs
+# standalone, long after the original migration), so both plugins'
+# rollback() methods re-discover it live via describe_table_security(). This
+# confirms that live re-discovery actually produces the right keyword choice
+# end-to-end through rollback_manager.rollback_table(), not just through the
+# forward migration path already covered by scenario 19.
+def test_scenario_20_materialized_view_rollback_uses_alter_mv_ddl():
+    from ..rollback.rollback_manager import rollback_table
+
+    fake = FakeUnityCatalogGateway()
+    table = _table("events_mv_rb")
+    fake.set_row_filter_state(table, RF_FN, ["business_unit"])
+    fake.set_column_mask_state(table, "email", MASK_FN_1)
+    fake.tables[table.full_name] = "MATERIALIZED_VIEW"
+
+    result = convert_table(table, fake, dry_run=False)
+    assert result.status == StepStatus.SUCCESS
+
+    fake.ddl_calls_with_table_type.clear()
+    rollback_result = rollback_table(table, result.rollback_metadata, fake, dry_run=False)
+
+    assert rollback_result.status == StepStatus.ROLLED_BACK
+    assert fake.row_filters[table.full_name] is not None
+    assert "email" in fake.column_masks[table.full_name]
+    assert fake.ddl_calls_with_table_type, "expected at least one table_type-aware DDL call during rollback"
+    assert all(call[2] == "MATERIALIZED_VIEW" for call in fake.ddl_calls_with_table_type)
+    ops_seen = {call[0] for call in fake.ddl_calls_with_table_type}
+    assert ops_seen == {"set_row_filter", "set_column_mask"}

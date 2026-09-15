@@ -22,13 +22,21 @@ from ..uc_gateway.models import TableRef
 # against a STREAMING_TABLE, and a full INVENTORY -> APPLY_ABAC -> FINALIZE
 # cycle was run and verified end-to-end (live SELECT confirmed correct
 # ABAC row-filter + mask enforcement, then correct legacy removal at
-# FINALIZE). MATERIALIZED_VIEW is deliberately NOT in this set yet: live
-# testing the same day showed `ALTER TABLE ...` fails outright against a
-# materialized view with EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE - it needs
-# `ALTER MATERIALIZED VIEW ...` instead, which requires real table-type-aware
-# plumbing through gateway.py (not yet implemented) - tracked as follow-up
-# work, do not add MATERIALIZED_VIEW here until that lands.
-SUPPORTED_TABLE_TYPES = frozenset({"MANAGED", "EXTERNAL", "STREAMING_TABLE"})
+# FINALIZE).
+#
+# MATERIALIZED_VIEW added the same week (2026-09-15, Track B): unlike
+# STREAMING_TABLE, plain `ALTER TABLE ...` DOES fail outright against a
+# materialized view with EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE - fixed by
+# threading `table_type` through PlannedObject/TagRequest/ConvertOptions
+# (base_plugin.py, tag_provisioner.py) into gateway.py's 5 mutating methods,
+# which now emit `ALTER MATERIALIZED VIEW ...` instead whenever
+# table_type == "MATERIALIZED_VIEW" (see `_alter_keyword_for()`). Also fixed
+# a `describe_table_security()` parser bug uncovered while testing this: a
+# materialized view's trailing `Total Size (bytes)` row under `# Column
+# Masks` was being mis-parsed as a phantom masked column. Confirmed live via
+# a full INVENTORY -> APPLY_ABAC -> FINALIZE cycle against a real
+# materialized view with correct SELECT-level enforcement at every stage.
+SUPPORTED_TABLE_TYPES = frozenset({"MANAGED", "EXTERNAL", "STREAMING_TABLE", "MATERIALIZED_VIEW"})
 
 
 @dataclass(frozen=True)

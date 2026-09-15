@@ -66,6 +66,16 @@ class PlannedObject:
     # will remove anything; it never creates a policy itself (that's
     # APPLY_ABAC's / full MIGRATE's job).
     abac_already_applied: bool = False
+    # Populated by validate() from discovery.security_state.table_type -
+    # threaded (NOT via TableRef, which is a hashable dict key used
+    # pervasively across resolved_match_columns/table_tags_cache/etc. and
+    # must never vary for "the same" table) through to TagRequest.table_type
+    # and ConvertOptions.table_type so gateway.py's mutating methods know
+    # whether to emit `ALTER TABLE` or `ALTER MATERIALIZED VIEW` (§16 item 2
+    # MATERIALIZED_VIEW support - confirmed live that plain `ALTER TABLE`
+    # fails outright against a materialized view with
+    # EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE).
+    table_type: str = "MANAGED"
 
 
 @dataclass(frozen=True)
@@ -102,6 +112,12 @@ class ConvertOptions:
     # legacy + final verify only, requires abac_already_applied=True on the
     # PlannedObject - never creates a policy itself).
     phase: str = "FULL"
+    # Populated once per table by table_converter.convert_table() from the
+    # discovery it already performs (see PlannedObject.table_type) - lets
+    # the *_convert_one/_apply_abac_one/_finalize_one methods below pass the
+    # right table_type into uc.drop_row_filter()/drop_column_mask() without
+    # a second describe_table_security() round-trip.
+    table_type: str = "MANAGED"
 
 
 class MigrationPlugin(Protocol):

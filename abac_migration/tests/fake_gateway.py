@@ -68,6 +68,14 @@ class FakeUnityCatalogGateway:
         self.dry_run_calls = []
         self.generic_sql_log = []
         self.pii_suggestion_calls = []
+        # Separate from mutation_calls (whose tuple shape ~150 existing
+        # tests already assert on) - records (op, table.full_name,
+        # table_type) for every call to the 5 table_type-aware mutating
+        # methods below, so MATERIALIZED_VIEW/STREAMING_TABLE-specific tests
+        # can assert which DDL keyword the real gateway would have chosen
+        # (see gateway.py's _alter_keyword_for()) without touching any
+        # pre-existing assertion.
+        self.ddl_calls_with_table_type = []
 
         self._raise_on = {}
         self._create_policy_failure = None  # (error_code, error_message) or None
@@ -226,36 +234,44 @@ class FakeUnityCatalogGateway:
         self.mutation_calls.append(("drop_policy", policy_name))
         self.policies.get(_securable_key(on_securable), {}).pop(policy_name, None)
 
-    def drop_row_filter(self, table: TableRef, dry_run: bool) -> None:
+    def drop_row_filter(self, table: TableRef, dry_run: bool, table_type: str = "MANAGED") -> None:
         if dry_run:
             self.dry_run_calls.append(("drop_row_filter", table.full_name))
             return
         self._maybe_raise("drop_row_filter")
         self.mutation_calls.append(("drop_row_filter", table.full_name))
+        self.ddl_calls_with_table_type.append(("drop_row_filter", table.full_name, table_type))
         self.row_filters[table.full_name] = None
 
-    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool) -> None:
+    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool, table_type: str = "MANAGED") -> None:
         if dry_run:
             self.dry_run_calls.append(("drop_column_mask", table.full_name, column))
             return
         self._maybe_raise("drop_column_mask")
         self.mutation_calls.append(("drop_column_mask", table.full_name, column))
+        self.ddl_calls_with_table_type.append(("drop_column_mask", table.full_name, table_type))
         self.column_masks.get(table.full_name, {}).pop(column, None)
 
-    def set_row_filter(self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool) -> None:
+    def set_row_filter(
+        self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
         if dry_run:
             self.dry_run_calls.append(("set_row_filter", table.full_name))
             return
         self._maybe_raise("set_row_filter")
         self.mutation_calls.append(("set_row_filter", table.full_name))
+        self.ddl_calls_with_table_type.append(("set_row_filter", table.full_name, table_type))
         self.row_filters[table.full_name] = RowFilterInfo(function_fqn=function_fqn, using_columns=list(using_columns))
 
-    def set_column_mask(self, table: TableRef, column: str, function_fqn: str, dry_run: bool) -> None:
+    def set_column_mask(
+        self, table: TableRef, column: str, function_fqn: str, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
         if dry_run:
             self.dry_run_calls.append(("set_column_mask", table.full_name, column))
             return
         self._maybe_raise("set_column_mask")
         self.mutation_calls.append(("set_column_mask", table.full_name, column))
+        self.ddl_calls_with_table_type.append(("set_column_mask", table.full_name, table_type))
         self.column_masks.setdefault(table.full_name, {})[column] = ColumnMaskInfo(column=column, function_fqn=function_fqn)
 
     def list_governed_tags(self) -> list:
@@ -295,12 +311,15 @@ class FakeUnityCatalogGateway:
     def list_column_tags(self, table: TableRef) -> list:
         return list(self.column_tags.get(table.full_name, []))
 
-    def set_column_tags(self, table: TableRef, column: str, tags: dict, dry_run: bool) -> None:
+    def set_column_tags(
+        self, table: TableRef, column: str, tags: dict, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
         if dry_run:
             self.dry_run_calls.append(("set_column_tags", table.full_name, column))
             return
         self._maybe_raise("set_column_tags")
         self.mutation_calls.append(("set_column_tags", table.full_name, column))
+        self.ddl_calls_with_table_type.append(("set_column_tags", table.full_name, table_type))
         remaining = [t for t in self.column_tags.setdefault(table.full_name, []) if not (t.column == column and t.tag_key in tags)]
         for key, value in tags.items():
             remaining.append(ColumnTagAssignment(column=column, tag_key=key, tag_value=value))

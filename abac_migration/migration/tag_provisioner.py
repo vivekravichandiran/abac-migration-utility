@@ -125,6 +125,12 @@ class TagRequest:
     # tables (§7.3 FunctionBasedPolicyStrategy is deferred, but the tag layer
     # underneath is already function-scoped in anticipation of it).
     function_fqn: str
+    # Threaded from PlannedObject.table_type (see base_plugin.py) so
+    # _mint_and_assign()'s uc.set_column_tags() call knows whether to emit
+    # `ALTER TABLE` or `ALTER MATERIALIZED VIEW` for THIS request's table -
+    # populated here (not read off TableRef) because TableRef must stay a
+    # plain (catalog, schema, table) key, never varying for "the same" table.
+    table_type: str = "MANAGED"
 
 
 TagResolutionKey = tuple  # (TableRef, str, str) - kept as plain tuple for hashability
@@ -342,7 +348,7 @@ class TagProvisioner:
                 )
 
             for req in key_only_reqs:
-                self._uc.set_column_tags(req.table, req.column, {tag_key: None}, dry_run=dry_run)
+                self._uc.set_column_tags(req.table, req.column, {tag_key: None}, dry_run=dry_run, table_type=req.table_type)
                 resolved[(req.table, req.column, req.role)] = MatchColumn(
                     tag_key=tag_key, tag_value=None, alias=_alias_for(req.column), source_column=req.column,
                 )

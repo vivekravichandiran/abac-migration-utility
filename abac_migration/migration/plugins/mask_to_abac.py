@@ -49,6 +49,7 @@ class ColumnMaskMigrationPlugin:
 
         legacy_masks = discovery.security_state.column_masks if discovery.security_state else []
         legacy_columns = {m.column for m in legacy_masks}
+        table_type = discovery.security_state.table_type if discovery.security_state else "MANAGED"
 
         planned = [self._validate_one_mask(table, mask, discovery, uc) for mask in legacy_masks]
 
@@ -61,21 +62,24 @@ class ColumnMaskMigrationPlugin:
             planned.append(PlannedObject(
                 masked_column=existing.column, source_function=existing.policy_def.function_fqn,
                 source_using_columns=[], tag_requests=[], decision="ALREADY_MIGRATED",
-                existing_policy_name=existing.policy_def.name,
+                existing_policy_name=existing.policy_def.name, table_type=table_type,
             ))
 
         return ValidationResult(planned_objects=planned)
 
     def _validate_one_mask(self, table, mask, discovery, uc) -> PlannedObject:
+        table_type = discovery.security_state.table_type if discovery.security_state else "MANAGED"
         if not uc.function_exists(mask.function_fqn):
             return PlannedObject(
                 masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_FOUND",
+                table_type=table_type,
             )
         if not uc.can_execute_function(mask.function_fqn):
             return PlannedObject(
                 masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
                 tag_requests=[], decision="FAILED", reason_code="SOURCE_FUNCTION_NOT_ACCESSIBLE",
+                table_type=table_type,
             )
 
         deterministic_name = self._policy_strategy.mask_policy_name(mask.column, mask.function_fqn)
@@ -106,14 +110,17 @@ class ColumnMaskMigrationPlugin:
                 return PlannedObject(
                     masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
                     tag_requests=[], decision="NOT_ELIGIBLE", reason_code="EXISTING_ABAC_POLICY_CONFLICT",
-                    existing_policy_name=deterministic_name,
+                    existing_policy_name=deterministic_name, table_type=table_type,
                 )
             abac_already_applied = existing_def is not None
 
-        tag_reqs = [TagRequest(table=table, column=mask.column, role="mask", function_fqn=mask.function_fqn)]
+        tag_reqs = [TagRequest(
+            table=table, column=mask.column, role="mask", function_fqn=mask.function_fqn, table_type=table_type,
+        )]
         return PlannedObject(
             masked_column=mask.column, source_function=mask.function_fqn, source_using_columns=[],
             tag_requests=tag_reqs, decision="PROCEED", abac_already_applied=abac_already_applied,
+            table_type=table_type,
         )
 
     def tag_requests(self, table: TableRef, validation: ValidationResult) -> list:
@@ -240,7 +247,7 @@ class ColumnMaskMigrationPlugin:
             )
 
         try:
-            uc.drop_column_mask(table, obj.masked_column, dry_run=False)
+            uc.drop_column_mask(table, obj.masked_column, dry_run=False, table_type=options.table_type)
         except Exception as exc:  # noqa: BLE001
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
@@ -307,7 +314,7 @@ class ColumnMaskMigrationPlugin:
             )
 
         try:
-            uc.drop_column_mask(table, obj.masked_column, dry_run=False)
+            uc.drop_column_mask(table, obj.masked_column, dry_run=False, table_type=options.table_type)
         except Exception as exc:  # noqa: BLE001 - converted into a taxonomy'd failure, never bubbled raw
             return ConversionStepResult(
                 object_type=self.object_type, status=StepStatus.FAILED, masked_column=obj.masked_column,
@@ -383,7 +390,11 @@ class ColumnMaskMigrationPlugin:
                 continue
 
             status = StepStatus.WOULD_ROLLBACK if dry_run else StepStatus.ROLLED_BACK
-            uc.set_column_mask(table, column, original["function"], dry_run=dry_run)
+            # rollback() has no ConvertOptions/PlannedObject to read
+            # table_type from - see the identical comment in
+            # rls_to_abac.py's rollback().
+            table_type = uc.describe_table_security(table).table_type
+            uc.set_column_mask(table, column, original["function"], dry_run=dry_run, table_type=table_type)
             results.append(ConversionStepResult(
                 object_type=self.object_type, status=status, masked_column=column, source_function=original["function"],
             ))

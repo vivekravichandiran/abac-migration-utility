@@ -70,15 +70,21 @@ appended to the `inventory` table. **No conversion happens** — this is the
 mode to run first against a new scope to see what you're dealing with
 before committing to a real migration.
 
-**Supported table types**: `MANAGED`, `EXTERNAL`, and `STREAMING_TABLE` are
-`ELIGIBLE`. Plain `VIEW` and `MATERIALIZED_VIEW` are always `NOT_ELIGIBLE`
-(`UNSUPPORTED_TABLE_TYPE`) today — confirmed live that a materialized view
-rejects the plain `ALTER TABLE ...` DDL this tool uses
-(`EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE`) and needs `ALTER MATERIALIZED
-VIEW ...` instead, which isn't implemented yet (tracked in `DESIGN.md` §16
-item 2). Streaming tables, by contrast, were confirmed live to need no
-special DDL at all — a full `INVENTORY -> APPLY_ABAC -> FINALIZE` cycle
-against a real streaming table works identically to a managed table.
+**Supported table types**: `MANAGED`, `EXTERNAL`, `STREAMING_TABLE`, and
+`MATERIALIZED_VIEW` are all `ELIGIBLE`. Only plain `VIEW` is always
+`NOT_ELIGIBLE` (`UNSUPPORTED_TABLE_TYPE`) — it has no underlying storage of
+its own to attach a row filter/mask to. Streaming tables were confirmed
+live to need no special DDL at all — plain `ALTER TABLE ...` works
+unmodified, and a full `INVENTORY -> APPLY_ABAC -> FINALIZE` cycle against
+a real streaming table works identically to a managed table. Materialized
+views are different: a real materialized view rejects the plain
+`ALTER TABLE ...` DDL outright (`EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE`) and
+needs `ALTER MATERIALIZED VIEW ...` instead — the gateway now detects this
+from the table's discovered `table_type` and picks the right DDL keyword
+automatically (`gateway.py`'s `_alter_keyword_for()`), so no configuration
+is needed to migrate a materialized view; it just works like any other
+supported table type. See `DESIGN.md` §16 item 2 for the full history
+(Track A = `STREAMING_TABLE`, Track B = `MATERIALIZED_VIEW`).
 
 ### `MIGRATE` / `INVENTORY_AND_MIGRATE`
 

@@ -105,7 +105,7 @@ SQL warehouse `5fe1692f119e2528` ("Serverless Starter Warehouse").
 
 | ID | Description | Severity | Status |
 |---|---|---|---|
-| DEF-01 | `describe_table_security()`'s column-mask parser mis-reads a `MATERIALIZED_VIEW`'s `DESCRIBE TABLE EXTENDED` output — a trailing `Total Size (bytes)` administrative row directly under `# Column Masks` (with no blank/`#` separator before it) is incorrectly parsed as a phantom masked column. | Low (only affects `MATERIALIZED_VIEW`, which is not yet an in-scope table type) | Open — tracked in `DESIGN.md` §16 item 2 as part of Track B (`MATERIALIZED_VIEW` support), not yet fixed. |
+| DEF-01 | `describe_table_security()`'s column-mask parser mis-reads a `MATERIALIZED_VIEW`'s `DESCRIBE TABLE EXTENDED` output — a trailing `Total Size (bytes)` administrative row directly under `# Column Masks` (with no blank/`#` separator before it) is incorrectly parsed as a phantom masked column. | Low (only affects `MATERIALIZED_VIEW`, which was not yet an in-scope table type at the time this was found) | **Fixed** (2026-09-15, Track B) — see `MATERIALIZED_VIEW_SUPPORT_TEST_CASES.md` for the fix and its regression tests. |
 
 No defects found affecting `STREAMING_TABLE` support (in-scope of this document).
 
@@ -129,5 +129,5 @@ No defects found affecting `STREAMING_TABLE` support (in-scope of this document)
 | Unit tests | 167/167 passed |
 | Live test cases | 5/5 passed (TC-01 through TC-05) |
 | Code changes required | 1 line (`inventory_manager.py`, `SUPPORTED_TABLE_TYPES`) |
-| Regressions introduced | None — `MANAGED`/`EXTERNAL` behavior unchanged, `VIEW`/`MATERIALIZED_VIEW` remain correctly blocked |
-| Recommendation | **Approved** — `STREAMING_TABLE` support (Track A) is safe to ship as-is. `MATERIALIZED_VIEW` support (Track B) requires separate implementation work before enabling (see `DESIGN.md` §16 item 2 and DEF-01 above). |
+| Regressions introduced | None — `MANAGED`/`EXTERNAL` behavior unchanged, `VIEW` remains correctly blocked |
+| Recommendation | **Approved** — `STREAMING_TABLE` support (Track A) shipped. `MATERIALIZED_VIEW` support (Track B) has since also shipped, with its own implementation and test cases — see `MATERIALIZED_VIEW_SUPPORT_TEST_CASES.md` and `DESIGN.md` §16 item 2. |

@@ -180,10 +180,19 @@ class UnityCatalogGateway(Protocol):
     def can_execute_function(self, function_fqn: str) -> bool: ...
     def create_or_replace_policy(self, spec: PolicySpec, dry_run: bool) -> PolicyApplyResult: ...
     def drop_policy(self, on_securable: str, policy_name: str, dry_run: bool) -> None: ...
-    def drop_row_filter(self, table: TableRef, dry_run: bool) -> None: ...
-    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool) -> None: ...
-    def set_row_filter(self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool) -> None: ...
-    def set_column_mask(self, table: TableRef, column: str, function_fqn: str, dry_run: bool) -> None: ...
+    # `table_type` (default "MANAGED", the pre-existing behavior) selects
+    # `ALTER TABLE` vs `ALTER MATERIALIZED VIEW` - see `_alter_keyword_for()`.
+    # Callers pass the table's real type (from TableSecurityState/
+    # PlannedObject/ConvertOptions/TagRequest.table_type, never re-derived
+    # from TableRef, which never carries it - see base_plugin.py).
+    def drop_row_filter(self, table: TableRef, dry_run: bool, table_type: str = "MANAGED") -> None: ...
+    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool, table_type: str = "MANAGED") -> None: ...
+    def set_row_filter(
+        self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None: ...
+    def set_column_mask(
+        self, table: TableRef, column: str, function_fqn: str, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None: ...
 
     # governed tags (§7.4)
     def list_governed_tags(self) -> list: ...
@@ -192,7 +201,9 @@ class UnityCatalogGateway(Protocol):
     def alter_governed_tag_set_values(self, tag_key: str, values: list, dry_run: bool) -> None: ...
     def drop_governed_tag(self, tag_key: str, dry_run: bool) -> None: ...
     def list_column_tags(self, table: TableRef) -> list: ...
-    def set_column_tags(self, table: TableRef, column: str, tags: dict, dry_run: bool) -> None: ...
+    def set_column_tags(
+        self, table: TableRef, column: str, tags: dict, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None: ...
 
     # LLM-assisted PII classification (INVENTORY-only, advisory)
     def suggest_pii_tag(self, function_fqn: str, columns: list, endpoint: str) -> "PiiSuggestion": ...
@@ -230,6 +241,19 @@ def _strip_backtick_fqn(text: str) -> str:
     if m:
         return ".".join(m.groups())
     return text.strip("`")
+
+
+# §16 item 2 (MATERIALIZED_VIEW support): confirmed live (2026-09-15,
+# ril_full_access_test.streaming_test) that a materialized view rejects
+# plain `ALTER TABLE ... SET/DROP ROW FILTER`/`... SET/DROP MASK`/`... SET
+# TAGS` outright with `BAD_REQUEST [EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE]
+# 'ALTER TABLE ...' expects a table but ... is a view` - `ALTER MATERIALIZED
+# VIEW ...` is required instead and confirmed to work identically. By
+# contrast, `STREAMING_TABLE` was confirmed the SAME day to need no keyword
+# change at all - plain `ALTER TABLE` already works against it - so it is
+# deliberately NOT branched here, only MATERIALIZED_VIEW is.
+def _alter_keyword_for(table_type: str) -> str:
+    return "ALTER MATERIALIZED VIEW" if table_type == "MATERIALIZED_VIEW" else "ALTER TABLE"
 
 
 class DatabricksUnityCatalogGateway:
@@ -311,7 +335,22 @@ class DatabricksUnityCatalogGateway:
                 row_filter = RowFilterInfo(function_fqn=fn, using_columns=using_columns, raw_text=text)
             elif label == "# Column Masks":
                 j = i + 1
-                while j < len(rows) and rows[j][0] and not rows[j][0].startswith("#"):
+                # The extra `(rows[j][1] or "").strip().startswith("`")` guard
+                # is required for MATERIALIZED_VIEW (confirmed live,
+                # 2026-09-15): its DESCRIBE TABLE EXTENDED output places a
+                # trailing `Total Size (bytes)` administrative row directly
+                # under `# Column Masks` with no blank/`#`-prefixed separator
+                # before it - the original blank/`#` check alone swallowed it
+                # as a phantom masked column named "Total Size (bytes)" with
+                # function "2137". Every genuine mask row's 2nd field is a
+                # backtick-quoted function FQN (see _strip_backtick_fqn); this
+                # administrative row's 2nd field never is, so it's now
+                # correctly excluded. Never observed on MANAGED/EXTERNAL/
+                # STREAMING_TABLE, but the guard is harmless for those too.
+                while (
+                    j < len(rows) and rows[j][0] and not rows[j][0].startswith("#")
+                    and (rows[j][1] or "").strip().startswith("`")
+                ):
                     col_name = rows[j][0].strip()
                     fn = _strip_backtick_fqn(rows[j][1] or "")
                     column_masks.append(ColumnMaskInfo(column=col_name, function_fqn=fn, raw_text=rows[j][1] or ""))
@@ -449,27 +488,34 @@ class DatabricksUnityCatalogGateway:
         # to make this call idempotent, per the confirmed finding in §17.
         self._execute(statement, treat_not_found_as="POLICY_NOT_FOUND")
 
-    def drop_row_filter(self, table: TableRef, dry_run: bool) -> None:
-        statement = f"ALTER TABLE {table.quoted_full_name} DROP ROW FILTER"
+    def drop_row_filter(self, table: TableRef, dry_run: bool, table_type: str = "MANAGED") -> None:
+        statement = f"{_alter_keyword_for(table_type)} {table.quoted_full_name} DROP ROW FILTER"
         if dry_run:
             return
         self._execute(statement)
 
-    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool) -> None:
-        statement = f"ALTER TABLE {table.quoted_full_name} ALTER COLUMN {quote_ident(column)} DROP MASK"
+    def drop_column_mask(self, table: TableRef, column: str, dry_run: bool, table_type: str = "MANAGED") -> None:
+        statement = f"{_alter_keyword_for(table_type)} {table.quoted_full_name} ALTER COLUMN {quote_ident(column)} DROP MASK"
         if dry_run:
             return
         self._execute(statement)
 
-    def set_row_filter(self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool) -> None:
+    def set_row_filter(
+        self, table: TableRef, function_fqn: str, using_columns: list, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
         quoted_cols = ", ".join(quote_ident(c) for c in using_columns)
-        statement = f"ALTER TABLE {table.quoted_full_name} SET ROW FILTER {function_fqn} ON ({quoted_cols})"
+        statement = f"{_alter_keyword_for(table_type)} {table.quoted_full_name} SET ROW FILTER {function_fqn} ON ({quoted_cols})"
         if dry_run:
             return
         self._execute(statement)
 
-    def set_column_mask(self, table: TableRef, column: str, function_fqn: str, dry_run: bool) -> None:
-        statement = f"ALTER TABLE {table.quoted_full_name} ALTER COLUMN {quote_ident(column)} SET MASK {function_fqn}"
+    def set_column_mask(
+        self, table: TableRef, column: str, function_fqn: str, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
+        statement = (
+            f"{_alter_keyword_for(table_type)} {table.quoted_full_name} "
+            f"ALTER COLUMN {quote_ident(column)} SET MASK {function_fqn}"
+        )
         if dry_run:
             return
         self._execute(statement)
@@ -550,13 +596,18 @@ class DatabricksUnityCatalogGateway:
             for row in res.rows
         ]
 
-    def set_column_tags(self, table: TableRef, column: str, tags: dict, dry_run: bool) -> None:
+    def set_column_tags(
+        self, table: TableRef, column: str, tags: dict, dry_run: bool, table_type: str = "MANAGED",
+    ) -> None:
         # A None value means a key-only/presence tag (confirmed live: `SET
         # TAGS ('key')` with no `= value` is valid syntax) - used whenever
         # tag_provisioner decides has_tag(key) is safe (no same-table
         # collision), to avoid needing an allowed-value entry at all.
         tags_clause = ", ".join(f"'{k}'" if v is None else f"'{k}' = '{v}'" for k, v in tags.items())
-        statement = f"ALTER TABLE {table.quoted_full_name} ALTER COLUMN {quote_ident(column)} SET TAGS ({tags_clause})"
+        statement = (
+            f"{_alter_keyword_for(table_type)} {table.quoted_full_name} "
+            f"ALTER COLUMN {quote_ident(column)} SET TAGS ({tags_clause})"
+        )
         if dry_run:
             return
         self._execute(statement)

@@ -133,10 +133,18 @@ def convert_table(
 
     validations = []
     all_tag_requests = []
+    table_type = "MANAGED"
     for plugin in plugins:
         if not plugin.applies_to(table, uc):
             continue
         discovery = plugin.discover(table, uc)
+        # Both plugins discover() the SAME table, so table_type is identical
+        # from either - captured once here (from whichever plugin runs
+        # first) rather than added as a third describe_table_security() call,
+        # and threaded into ConvertOptions below so convert() can pick
+        # ALTER TABLE vs ALTER MATERIALIZED VIEW without re-discovering it.
+        if discovery.security_state is not None:
+            table_type = discovery.security_state.table_type
         validation = plugin.validate(table, discovery, uc)
         validations.append((plugin, validation))
         if phase != "FINALIZE":
@@ -149,7 +157,7 @@ def convert_table(
             provisioner = TagProvisioner(uc, prefer_existing_tags=prefer_existing_tags, team_prefix=team_prefix)
             resolved.update(provisioner.prepare(missing, dry_run=dry_run))
 
-    options = ConvertOptions(dry_run=dry_run, resolved_match_columns=resolved, phase=phase)
+    options = ConvertOptions(dry_run=dry_run, resolved_match_columns=resolved, phase=phase, table_type=table_type)
 
     step_results = []
     for plugin, validation in validations:
