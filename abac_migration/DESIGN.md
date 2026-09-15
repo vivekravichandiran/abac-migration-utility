@@ -736,7 +736,7 @@ and report **per row-filter / per masked-column**, exactly as scenarios
 | Condition | Eligibility | Reason code |
 |---|---|---|
 | No row filter AND no column masks | NOT_ELIGIBLE | `NO_LEGACY_SECURITY_FOUND` |
-| Table type unsupported for ABAC policies (verify per target DBR — flagged §11) | NOT_ELIGIBLE | `UNSUPPORTED_TABLE_TYPE` |
+| Table type unsupported for ABAC policies — `SUPPORTED_TABLE_TYPES = {MANAGED, EXTERNAL, STREAMING_TABLE}` (confirmed live 2026-09-15; `VIEW`/`MATERIALIZED_VIEW` remain excluded pending §16 item 2 follow-up) | NOT_ELIGIBLE | `UNSUPPORTED_TABLE_TYPE` |
 | Everything else (table is *attempted*; per-object outcome, including a missing function or a conflicting policy on any one object, is decided by the plugins during `convert_table()` — `SOURCE_FUNCTION_UNAVAILABLE`/`EXISTING_ABAC_POLICY_CONFLICT` are now per-object `ConversionStepResult` outcomes, not table-level inventory reasons) | ELIGIBLE | — |
 
 ---
@@ -1138,7 +1138,7 @@ assumed by this design.
 | Existing ABAC policy already present (someone migrated manually, or pre-existing unrelated policy) | `EXISTING_ABAC_POLICY_CONFLICT` if it doesn't match desired spec — never silently overwritten; `ALREADY_MIGRATED` if it matches (idempotent) |
 | Function deleted/renamed/permission-revoked between inventory and migration | `pre_validation` re-checks live state immediately before `convert()`, not just at inventory time |
 | Concurrent runs (two people/jobs running the utility at once against overlapping scope) | `run_id`-scoped audit rows avoid record collisions; actual UC mutation via `CREATE POLICY` is itself atomic per statement, but the design does **not** claim distributed-lock-level exactly-once — documented as a v1 limitation; recommend `max_parallelism` scoped to a job with exclusive scope, not concurrently overlapping jobs |
-| View / materialized view / streaming table variants | Table-type-specific ABAC support must be checked against target DBR before enabling (`UNSUPPORTED_TABLE_TYPE` guard, §7.5) rather than assumed |
+| View / materialized view / streaming table variants | `STREAMING_TABLE` confirmed live-safe and enabled (§16 item 2). `VIEW`/`MATERIALIZED_VIEW` remain gated behind `UNSUPPORTED_TABLE_TYPE` (§7.5) until the table-type-aware DDL keyword plumbing + `describe_table_security()` parser fix (§16 item 2) land — `MATERIALIZED_VIEW` confirmed to hard-fail with plain `ALTER TABLE ...` |
 | **Governed tags are an account-wide shared namespace** (new, §7.4) | `tag_provisioner` prefers reusing existing/built-in classification tags (`class.*`) over minting new ones; when minting is required, one deterministic key is minted **per distinct legacy function** (REVISED, was originally 2 fixed keys for the whole utility) — bounds namespace growth to the number of distinct legacy functions being migrated, not the number of migrated columns, while keeping each key traceable back to one function |
 | **`ALTER GOVERNED TAG ... SET VALUES` is declarative/full-replace** (new, §7.4) | Governed-tag value provisioning is deliberately pulled out of the parallel per-table phase into one serialized "Prepare Tags" step per run, batching all needed values into a single read-union-write per key — eliminates the read-modify-write race under `max_parallelism > 1` |
 | **Governed tag propagation delay (~20-30s) before a new value is usable in `CREATE POLICY`** (new, §7.4, confirmed empirically) | Resilience layer (§10.1) retries `UC_INVALID_POLICY_CONDITION`/"Invalid tag value" errors with backoff for a bounded window specifically when that value was provisioned earlier in the same run; a `Prepare Governed Tags` step also naturally runs before the parallel conversion phase, giving propagation a head start |
@@ -1197,6 +1197,24 @@ remains:
 2. Confirm minimum supported table types for ABAC row filter/column mask
    policies on the target DBR version (views, materialized/streaming
    tables) before enabling those table types in scope resolution.
+   **PARTIALLY RESOLVED (2026-09-15, live spike against
+   `ril_full_access_test.streaming_test`):** `STREAMING_TABLE` is now in
+   `SUPPORTED_TABLE_TYPES` — confirmed live that plain `ALTER TABLE ...
+   SET/DROP ROW FILTER`, `... SET/DROP MASK`, and `... SET TAGS` all work
+   completely unmodified against a real streaming table, and a full
+   `INVENTORY -> APPLY_ABAC -> FINALIZE` cycle was run end-to-end with
+   correct enforcement verified via live `SELECT` at each phase. Plain
+   views (`VIEW`) and `MATERIALIZED_VIEW` remain excluded and
+   `NOT_ELIGIBLE`/`UNSUPPORTED_TABLE_TYPE` — live testing the same day
+   confirmed `ALTER TABLE ...` fails outright against a materialized view
+   (`BAD_REQUEST [EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE]`); it requires
+   `ALTER MATERIALIZED VIEW ...` instead, which needs real table-type-aware
+   plumbing through `gateway.py`'s 5 mutating methods (`drop_row_filter`,
+   `drop_column_mask`, `set_row_filter`, `set_column_mask`,
+   `set_column_tags`) plus a `describe_table_security()` parser fix (its
+   column-mask loop currently mis-parses a materialized view's trailing
+   `Total Size (bytes)` row as a phantom masked column) — tracked as
+   follow-up work, not yet implemented.
 3. **NEW (discovered during §17 spike): decide the exact reuse-vs-mint
    heuristic for governed tags** (§7.4 point 1) — e.g. should the utility
    ever trust a pre-existing `class.email_address`-style tag as sufficient

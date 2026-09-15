@@ -538,3 +538,27 @@ def test_scenario_17_mask_shared_by_two_columns_of_same_table_stays_key_only_and
     assert shared_tags[0].tag_key == shared_tags[1].tag_key  # one shared key
     assert shared_tags[0].tag_value is None and shared_tags[1].tag_value is None  # no value, ever
     assert fake.governed_tags[shared_tags[0].tag_key].values == []
+
+
+# 18 - STREAMING_TABLE with RLS + a mask - eligibility gate opened up after
+# live testing (2026-09-15, ril_full_access_test.streaming_test) confirmed
+# a real STREAMING_TABLE needs no gateway/DDL changes at all: plain
+# `ALTER TABLE ...` works unmodified for SET/DROP ROW FILTER, SET/DROP MASK
+# and SET TAGS. This is a regression test that a full MIGRATE against a
+# STREAMING_TABLE-typed table behaves identically to a MANAGED one.
+def test_scenario_18_streaming_table_full_migrate_succeeds():
+    fake = FakeUnityCatalogGateway()
+    table = _table("events_streaming_tbl")
+    fake.set_row_filter_state(table, RF_FN, ["business_unit"])
+    fake.set_column_mask_state(table, "email", MASK_FN_1)
+    fake.tables[table.full_name] = "STREAMING_TABLE"  # set_*_state calls register_table(MANAGED) internally
+
+    result = convert_table(table, fake, dry_run=False)
+
+    assert result.rls_status == StepStatus.SUCCESS
+    assert result.column_mask_status == {"email": StepStatus.SUCCESS}
+    assert result.status == StepStatus.SUCCESS
+    assert fake.row_filters[table.full_name] is None
+    assert fake.column_masks[table.full_name] == {}
+    assert "abac_migrated_row_filter" in fake.policies[table.full_name]
+    assert fake.tables[table.full_name] == "STREAMING_TABLE"

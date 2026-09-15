@@ -98,6 +98,43 @@ def test_unsupported_table_type_is_not_eligible():
     assert record.eligibility_reason == "UNSUPPORTED_TABLE_TYPE"
 
 
+def test_materialized_view_is_still_not_eligible():
+    """MATERIALIZED_VIEW is deliberately NOT in SUPPORTED_TABLE_TYPES yet -
+    live testing (2026-09-15, ril_full_access_test) confirmed `ALTER TABLE
+    ...` fails outright against one (EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE),
+    requiring `ALTER MATERIALIZED VIEW ...` instead - real gateway plumbing
+    not yet implemented. This must keep returning NOT_ELIGIBLE until that
+    follow-up lands, so the tool never attempts a mutation guaranteed to
+    fail server-side."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "an_mv")
+    uc.set_row_filter_state(table, "cat.schema.rf_fn", ["region"])
+    uc.tables[table.full_name] = "MATERIALIZED_VIEW"
+
+    record = build_inventory_record(table, uc, run_id="run-1")
+
+    assert record.migration_eligibility == "NOT_ELIGIBLE"
+    assert record.eligibility_reason == "UNSUPPORTED_TABLE_TYPE"
+
+
+def test_streaming_table_is_eligible():
+    """STREAMING_TABLE was added to SUPPORTED_TABLE_TYPES after live
+    testing (2026-09-15, ril_full_access_test.streaming_test) confirmed a
+    full INVENTORY -> APPLY_ABAC -> FINALIZE cycle works unmodified against
+    a real streaming table - plain `ALTER TABLE ...` DDL works fine, no
+    `ALTER STREAMING TABLE` keyword needed (unlike MATERIALIZED_VIEW,
+    see test_materialized_view_is_still_not_eligible)."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "a_streaming_tbl")
+    uc.set_row_filter_state(table, "cat.schema.rf_fn", ["region"])
+    uc.tables[table.full_name] = "STREAMING_TABLE"
+
+    record = build_inventory_record(table, uc, run_id="run-1")
+
+    assert record.migration_eligibility == "ELIGIBLE"
+    assert record.eligibility_reason is None
+
+
 def test_permission_denied_table_is_not_eligible_and_does_not_raise():
     """Live ALL_CATALOGS run finding #3: a table can be listable (SHOW
     TABLES only needs USE SCHEMA) while DESCRIBE TABLE EXTENDED still denies

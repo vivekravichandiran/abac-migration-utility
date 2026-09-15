@@ -70,6 +70,16 @@ appended to the `inventory` table. **No conversion happens** — this is the
 mode to run first against a new scope to see what you're dealing with
 before committing to a real migration.
 
+**Supported table types**: `MANAGED`, `EXTERNAL`, and `STREAMING_TABLE` are
+`ELIGIBLE`. Plain `VIEW` and `MATERIALIZED_VIEW` are always `NOT_ELIGIBLE`
+(`UNSUPPORTED_TABLE_TYPE`) today — confirmed live that a materialized view
+rejects the plain `ALTER TABLE ...` DDL this tool uses
+(`EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE`) and needs `ALTER MATERIALIZED
+VIEW ...` instead, which isn't implemented yet (tracked in `DESIGN.md` §16
+item 2). Streaming tables, by contrast, were confirmed live to need no
+special DDL at all — a full `INVENTORY -> APPLY_ABAC -> FINALIZE` cycle
+against a real streaming table works identically to a managed table.
+
 ### `MIGRATE` / `INVENTORY_AND_MIGRATE`
 
 Does everything `INVENTORY` does, then additionally:

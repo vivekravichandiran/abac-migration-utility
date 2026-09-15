@@ -16,10 +16,19 @@ from ..migration.policy_strategy import PolicyStrategy, TableBasedPolicyStrategy
 from ..uc_gateway.gateway import UCGatewayError, UnityCatalogGateway, is_permission_denied
 from ..uc_gateway.models import TableRef
 
-# §16 item 2: exact minimum supported table types per target DBR remain to
-# be confirmed; conservatively only MANAGED/EXTERNAL are treated as
-# eligible until that's verified, per the UNSUPPORTED_TABLE_TYPE guard in §7.5.
-SUPPORTED_TABLE_TYPES = frozenset({"MANAGED", "EXTERNAL"})
+# §16 item 2: STREAMING_TABLE confirmed live (2026-09-15, ril_full_access_test)
+# to need ZERO gateway/DDL changes - plain `ALTER TABLE ... SET/DROP ROW
+# FILTER`, `... SET/DROP MASK`, and `... SET TAGS` all work unmodified
+# against a STREAMING_TABLE, and a full INVENTORY -> APPLY_ABAC -> FINALIZE
+# cycle was run and verified end-to-end (live SELECT confirmed correct
+# ABAC row-filter + mask enforcement, then correct legacy removal at
+# FINALIZE). MATERIALIZED_VIEW is deliberately NOT in this set yet: live
+# testing the same day showed `ALTER TABLE ...` fails outright against a
+# materialized view with EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE - it needs
+# `ALTER MATERIALIZED VIEW ...` instead, which requires real table-type-aware
+# plumbing through gateway.py (not yet implemented) - tracked as follow-up
+# work, do not add MATERIALIZED_VIEW here until that lands.
+SUPPORTED_TABLE_TYPES = frozenset({"MANAGED", "EXTERNAL", "STREAMING_TABLE"})
 
 
 @dataclass(frozen=True)
