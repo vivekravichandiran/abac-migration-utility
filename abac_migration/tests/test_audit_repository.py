@@ -14,8 +14,11 @@ from __future__ import annotations
 
 from abac_migration.audit.audit_repository import (
     _MIGRATION_AUDIT_EXPECTED_COLUMNS,
+    _TAG_GRANT_EXPECTED_COLUMNS,
     _add_missing_columns,
     _existing_columns,
+    AuditRepository,
+    TagGrantAuditRecord,
 )
 from abac_migration.uc_gateway.gateway import UCGatewayError
 
@@ -89,3 +92,84 @@ def test_existing_columns_is_case_insensitive_and_skips_comment_rows():
     cols = _existing_columns(gw, "cat.schema.migration_audit")
 
     assert cols == {"run_id", "status"}
+
+
+# ---------------------------------------------------------------------------
+# tag_grants table (§7.4 point 6): a dedicated, tag-scoped audit table
+# alongside inventory/migration_audit - same DDL/backfill/append pattern,
+# just a different row shape (one row per distinct tag_key granted, not per
+# table/object).
+# ---------------------------------------------------------------------------
+
+def test_tag_grant_backfill_uses_its_own_expected_columns():
+    existing_rows = [[name] for name, _ in _TAG_GRANT_EXPECTED_COLUMNS if name != "error_code"]
+    gw = _RecordingGateway(describe_rows=existing_rows)
+
+    _add_missing_columns(gw, "cat.schema.tag_grants", _TAG_GRANT_EXPECTED_COLUMNS, dry_run=False)
+
+    alter_statements = [s for s in gw.statements if s.startswith("ALTER TABLE")]
+    assert len(alter_statements) == 1
+    assert "error_code STRING" in alter_statements[0]
+
+
+def test_ensure_tables_exist_creates_tag_grants_table_and_backfills_it():
+    gw = _RecordingGateway(describe_rows=[[name] for name, _ in _TAG_GRANT_EXPECTED_COLUMNS])
+    repo = AuditRepository(gw, "cat.schema", "cat.schema.migration_audit", "cat.schema.inventory")
+
+    repo.ensure_tables_exist(dry_run=False)
+
+    create_statements = [s for s in gw.statements if "CREATE TABLE IF NOT EXISTS" in s and "tag_grants" in s]
+    assert len(create_statements) == 1
+    assert "principals ARRAY<STRING>" in create_statements[0]
+
+
+def test_tag_grants_table_fqn_defaults_alongside_other_audit_tables():
+    gw = _RecordingGateway()
+    repo = AuditRepository(gw, "cat.schema", "cat.schema.migration_audit", "cat.schema.inventory")
+    assert repo._tag_grants_table_fqn == "cat.schema.tag_grants"
+
+
+def test_tag_grants_table_fqn_override_is_respected():
+    gw = _RecordingGateway()
+    repo = AuditRepository(
+        gw, "cat.schema", "cat.schema.migration_audit", "cat.schema.inventory",
+        tag_grants_table_fqn="cat.schema.custom_tag_grants",
+    )
+    assert repo._tag_grants_table_fqn == "cat.schema.custom_tag_grants"
+
+
+def test_append_tag_grant_inserts_into_tag_grants_table():
+    gw = _RecordingGateway()
+    repo = AuditRepository(gw, "cat.schema", "cat.schema.migration_audit", "cat.schema.inventory")
+
+    repo.append_tag_grant(
+        TagGrantAuditRecord(
+            run_id="run-1", tag_key="abac_rls_cat_sch_fn", principals=["servicePrincipals/spn-1"],
+            role="roles/tagPolicy.assigner", status="GRANTED", dry_run=False,
+        ),
+        dry_run=False,
+    )
+
+    insert_statements = [s for s in gw.statements if s.startswith("INSERT INTO")]
+    assert len(insert_statements) == 1
+    assert "cat.schema.tag_grants" in insert_statements[0]
+    assert "'abac_rls_cat_sch_fn'" in insert_statements[0]
+    assert "'GRANTED'" in insert_statements[0]
+
+
+def test_append_tag_grant_persists_error_fields_on_failure():
+    gw = _RecordingGateway()
+    repo = AuditRepository(gw, "cat.schema", "cat.schema.migration_audit", "cat.schema.inventory")
+
+    repo.append_tag_grant(
+        TagGrantAuditRecord(
+            run_id="run-1", tag_key="abac_rls_cat_sch_fn", principals=["servicePrincipals/spn-1"],
+            role="roles/tagPolicy.assigner", status="FAILED", error_code="SPN_NOT_FOUND",
+            error_message="ServicePrincipal not found", dry_run=False,
+        ),
+        dry_run=False,
+    )
+
+    insert_statement = gw.statements[-1]
+    assert "'SPN_NOT_FOUND'" in insert_statement
+    assert "ServicePrincipal not found" in insert_statement

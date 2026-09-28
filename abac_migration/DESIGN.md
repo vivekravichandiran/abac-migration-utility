@@ -649,6 +649,68 @@ a step between `validate()` and `convert()`'s `CREATE POLICY` call:
    working syntax, §17) is available for a full teardown of synthetic keys,
    but is a deliberate, separate, human-invoked operation — never part of
    automatic per-table rollback.
+6. **Granting a third-party principal (typically an SPN) access to attach/
+   use a governed tag has NO SQL grammar at all** (new, added on request —
+   confirmed against Databricks docs AND live, 2026-09-28, against this
+   project's own `ril_catalog_test_pat` / workspace
+   `adb-7405616318078204`). This is the **one operation in this entire
+   tool that is not plain SQL over the warehouse** — permission management
+   on a governed tag ("tag policy") is a completely separate,
+   account-level, rule-set-based mechanism (also used for account groups/
+   SPNs/budget policies): the **Account Access Control Proxy API**
+   (`uc_gateway/access_control_client.py`, new module). Confirmed-live
+   mechanics:
+   - `GET /api/2.1/tag-policies/{tag_key}` (NOT
+     `/api/2.1/unity-catalog/tag-policies/...` — that 404s) returns
+     `{tag_key, id, account_id, ...}` in one call; `id` (a UUID distinct
+     from `tag_key`) + `account_id` are exactly what the ACL resource path
+     needs — no separate account-ID-discovery step required.
+   - The rule-set resource is
+     `accounts/<account_id>/tagPolicies/<id>/ruleSets/default`, read via
+     `GET {workspace-host}/api/2.0/preview/accounts/access-control/rule-sets?name=<resource>&etag=`
+     (an empty `etag` param is required and works for a first read — a
+     bare `GET` with no `etag` param 400s) — this workspace-proxied form
+     (no `account_id` in the URL path itself) works with the plain,
+     already-`all-apis`-scoped M2M token this tool uses everywhere else;
+     no extra OAuth scope needed.
+   - `PUT` on the same URL/body shape is a **full replace** of
+     `grant_rules` (same read-modify-write caution as point 3 above, and
+     for the same reason — there is no additive "add one grant" verb) —
+     confirmed live that blindly appending one new rule while preserving
+     every pre-existing one (including the tag creator's own automatic
+     `roles/tagPolicy.manager` grant from creating the tag — confirmed
+     live, granted with **zero** extra calls) round-trips correctly.
+     Confirmed the server also de-duplicates identical rules server-side
+     (adding the exact same rule twice left `grant_rules` at the same
+     length and didn't even bump the `etag`) — `grant_tag_role()` still
+     does its own pre-check to skip the round trip when nothing would
+     change, for a cleaner audit trail, not because the server needs it.
+   - Only 2 account roles are ever granted: `roles/tagPolicy.assigner`
+     (attach/use only) and `roles/tagPolicy.manager` (full control — edit
+     values, delete, re-grant) — surfaced as the config-level
+     `tag_grantee_role` = `"ASSIGN"` (default) | `"MANAGE"`, never a raw
+     role string, and validated (`ConfigError` on anything else) before it
+     ever reaches this module.
+   - Granting to a principal that doesn't exist in the account returns a
+     clean, catchable `400 BAD_REQUEST "ServicePrincipal <id> not found"`
+     — confirmed NOT a 403, i.e. the permission check itself passes and
+     only the target principal is invalid.
+
+   `tag_provisioner.py` gains `tag_grantee_principals`/`tag_grantee_role`
+   constructor parameters (from `RunConfig`, empty list by default = fully
+   inert, zero grant calls, zero behavior/latency change) and grants the
+   configured role to the configured principals on every DISTINCT governed
+   tag `prepare()` resolves each call — **newly minted OR reused**
+   (deliberate: a tag minted by an earlier run, before this parameter
+   existed or with different grantees, self-heals on the next run that
+   touches it), once per distinct `tag_key`, never once per column/request
+   (many resolved columns commonly share one tag_key). A grant failure
+   (e.g. the error mode above) is captured as a `TagGrantResult(status=
+   "FAILED", ...)` and recorded to a new, dedicated `tag_grants` audit
+   table (`audit/audit_repository.py` — tag-scoped, not table-scoped, so
+   it doesn't fit `migration_audit`'s per-object row shape) — it **never**
+   aborts the table's own migration, same graceful-degradation posture as
+   every other optional/best-effort step in this tool.
 
 ### 7.3.1 `PolicyScope`: Table Level vs. Catalog Level Application (both implemented)
 
@@ -990,6 +1052,8 @@ Rules:
 | `policy_to_principals` | JSON array (str) | `["account users"]` | overridable if an org wants a narrower default `TO` clause |
 | `policy_except_principals` | JSON array (str) | `[]` | principals fully exempted (`TO ... EXCEPT principal [, ...]`, confirmed live CREATE POLICY grammar) from every ABAC policy this run creates - e.g. a service principal that runs unmasked ETL, or a break-glass admin group. Empty = no `EXCEPT` clause, unchanged prior behavior |
 | `tag_team_prefix` | str | `""` (empty) | optional namespace segment (§7.4 point 2a) inserted right after `abac_rls_`/`abac_colmask_` in every governed tag key AND every policy name this run creates, under BOTH `policy_scope`s - e.g. `"mobility"` -> `abac_colmask_mobility_<cat>_<sch>_<fn>`. Empty = omitted entirely, unchanged prior behavior. Must be identical across Inventory -> Apply-ABAC -> Finalize, same rule as `policy_scope` |
+| `tag_grantee_principals` | JSON array (str) | `[]` | principals (typically one SPN, but a list to also allow groups/multiple SPNs) granted `tag_grantee_role` on every governed tag this run creates OR reuses (§7.4 point 6) - each entry a bare SPN application-ID UUID (auto-prefixed `servicePrincipals/`) or an already fully-qualified `servicePrincipals/`\|`groups/`\|`users/` string. Real REST (Account Access Control Proxy), not SQL. Empty = feature off, zero grant calls, unchanged prior behavior |
+| `tag_grantee_role` | str enum | `ASSIGN` | `ASSIGN` (-> account role `roles/tagPolicy.assigner`, attach/use only) \| `MANAGE` (-> `roles/tagPolicy.manager`, full control) - case-insensitive, `ConfigError` on any other value (§7.4 point 6) |
 | `enable_llm_pii_tagging` | bool | `false` | `INVENTORY`-only, advisory: classify each legacy function's likely PII category via `ai_query()` from its name+columns alone (never row data) |
 | `pii_llm_endpoint` | str | `databricks-meta-llama-3-3-70b-instruct` | Foundation Model API endpoint used by `enable_llm_pii_tagging` |
 | `run_id` | str | generated UUID if blank | allows resuming/correlating a specific run, e.g. for `ROLLBACK` mode targeting one prior run |
@@ -1026,7 +1090,8 @@ abac_migration/
 │   ├── gateway.py                     # UnityCatalogGateway Protocol + real impl (SQL via Spark session in-notebook)
 │   ├── retry.py                       # RetryPolicy, with_retries() - resilient call wrapper (§10.1) - built + tested in §17
 │   ├── sql_statement_client.py        # resilient SQL Statement Execution API client (used outside notebooks, e.g. spikes/local tooling)
-│   └── models.py                      # TableSecurityState, PolicyRef, PolicyDefinition, PolicySpec, PolicyApplyResult
+│   ├── access_control_client.py       # Account Access Control Proxy REST client - tag-policy grants only, NOT SQL (§7.4 point 6)
+│   └── models.py                      # TableSecurityState, PolicyRef, PolicyDefinition, PolicySpec, PolicyApplyResult, TagGrantResult
 ├── inventory/
 │   ├── __init__.py
 │   ├── inventory_manager.py
@@ -1052,7 +1117,7 @@ abac_migration/
 │   └── rollback_manager.py
 ├── audit/
 │   ├── __init__.py
-│   └── audit_repository.py            # + inline DDL for the 2 audit tables (§4)
+│   └── audit_repository.py            # + inline DDL for the 3 audit tables (§4, §7.4 point 6 for the 3rd, `tag_grants`)
 ├── notebook/
 │   └── abac_migration_driver.py       # thin entry point (Databricks notebook source format)
 └── tests/
@@ -1111,6 +1176,8 @@ actually worked (or the exact error that proved a variant does *not* work).
 | List all governed tags (incl. built-ins) | `SHOW GOVERNED TAGS` | **CONFIRMED — executed live.** Databricks ships a rich set of built-in classification governed tags out of the box (e.g. `class.email_address`, `class.us_ssn`, `class.credit_card`, `class.phone_number`, `class.name`, `class.location`, ~20 total observed) — these should be **preferred over minting synthetic tags** when they already correctly identify the target column (§7.4 point 1). |
 | Inspect one governed tag's definition | `DESCRIBE GOVERNED TAG tag_key` | **CONFIRMED — executed live**, returns `Tag Key`, `Id`, `Values`, `Create/Update Time` |
 | Remove a governed tag entirely | `DROP GOVERNED TAG tag_key` | **CONFIRMED — executed live** (used for spike cleanup). Per design (§7.4 point 5), reserved for deliberate human-invoked teardown, never automatic per-table rollback. |
+| Look up a governed tag's `id`/`account_id` for ACL purposes | `GET /api/2.1/tag-policies/{tag_key}` | **CONFIRMED — executed live (2026-09-28 spike).** `/api/2.1/unity-catalog/tag-policies/...` 404s; `/api/2.0/tag-policies` 404s with `FEATURE_DISABLED` ("Private Preview Tag Policy API is deprecated"). Returns `{tag_key, id, account_id, description, create_time, update_time, assignment_locked}` in one call. |
+| Grant/read tag-policy access (§7.4 point 6) | `GET`/`PUT {workspace-host}/api/2.0/preview/accounts/access-control/rule-sets` with `name=accounts/<account_id>/tagPolicies/<id>/ruleSets/default` | **CONFIRMED — executed live (2026-09-28 spike).** NOT SQL — no `GRANT ... ON GOVERNED TAG` grammar exists. `GET` requires an `etag` query param (even empty `""` for a first read — omitting it 400s: `"Missing required field: etag"`). `PUT` is a full replace of `grant_rules` (read-modify-write, same caution as point 3 above) — confirmed a blind append preserving the tag creator's own automatic `roles/tagPolicy.manager` grant round-trips correctly, and the server de-duplicates identical rules (no length/etag change on a repeat grant). Granting a nonexistent principal returns a clean `400 BAD_REQUEST "ServicePrincipal <id> not found"`, confirmed NOT a 403. Works with the plain, already-`all-apis`-scoped M2M token this tool uses everywhere else — no extra OAuth scope needed. |
 | Coexistence of legacy RLS/mask and an ABAC policy on the same table | n/a | **CONFIRMED — executed live**: `CREATE POLICY` succeeds while a legacy `ALTER TABLE ... SET ROW FILTER`/`SET MASK` is still active on the same table/column — no conflict error. Querying the table with both active produces results consistent with both being enforced (verified: same masked/filtered outcome as either mechanism alone, using the same underlying function) — validates the safety-first ordering in §8 (both mechanisms can safely coexist mid-migration). |
 | Remove ABAC policy | `DROP POLICY name ON TABLE t` | **CONFIRMED — executed live.** ⚠️ **Revision**: `IF EXISTS` is **not** supported by the grammar (`DROP POLICY IF EXISTS ...` fails with `PARSE_SYNTAX_ERROR: missing 'ON'`) — confirmed against current docs too (no `IF EXISTS` in the syntax). Re-dropping an already-dropped policy raises `POLICY_NOT_FOUND` (`BAD_REQUEST`), which `rollback_manager` must explicitly catch and treat as an idempotent no-op, rather than relying on `IF EXISTS` syntax sugar. |
 | Remove legacy row filter | `ALTER TABLE t DROP ROW FILTER` | **CONFIRMED — executed live**, including while an ABAC policy remains on the table (post-condition: `SHOW POLICIES` still lists the ABAC policy, query now enforced by ABAC alone). |
@@ -1143,6 +1210,7 @@ assumed by this design.
 | **`ALTER GOVERNED TAG ... SET VALUES` is declarative/full-replace** (new, §7.4) | Governed-tag value provisioning is deliberately pulled out of the parallel per-table phase into one serialized "Prepare Tags" step per run, batching all needed values into a single read-union-write per key — eliminates the read-modify-write race under `max_parallelism > 1` |
 | **Governed tag propagation delay (~20-30s) before a new value is usable in `CREATE POLICY`** (new, §7.4, confirmed empirically) | Resilience layer (§10.1) retries `UC_INVALID_POLICY_CONDITION`/"Invalid tag value" errors with backoff for a bounded window specifically when that value was provisioned earlier in the same run; a `Prepare Governed Tags` step also naturally runs before the parallel conversion phase, giving propagation a head start |
 | **Minimum DBR version mismatch between features** (new, §13) | `CREATE POLICY` needs DBR 16.4+, but `CREATE/ALTER GOVERNED TAG` needs DBR 18.1+ — `pre_validation` must check for 18.1+ (the higher requirement) given governed tags are now a hard dependency, not the lower 16.4 figure originally assumed |
+| **Granting tag-policy access to an SPN has no SQL grammar** (new, §7.4 point 6) | Real REST via the Account Access Control Proxy API (`uc_gateway/access_control_client.py`), the one non-SQL call in this tool — gated entirely behind `tag_grantee_principals` (empty by default, zero grant calls/behavior change); a grant failure is recorded to the new `tag_grants` audit table and never aborts the table's own migration |
 | Very large scope (thousands of tables) | Scope resolution and inventory are streamed/paginated, not materialized entirely in driver memory where avoidable; `max_parallelism` bounds concurrent UC calls; audit writes batched |
 | Partial migration leaves both mechanisms active simultaneously (verify-final-state failure) | Explicitly the *safe* failure mode (over-protective, not a gap) — surfaced loudly in the summary report as `FAILED`/`OLD_MECHANISM_REMOVAL_UNVERIFIED` requiring manual follow-up, never auto-retried silently |
 | Rollback requested after the source function has since been dropped/altered | `rollback_metadata` captures the function *reference*, not its body; if the function no longer exists, `rollback()` fails fast with a clear error rather than silently reapplying a broken RLS/mask |
@@ -1306,3 +1374,29 @@ documentation-only assumptions. All spike-created Unity Catalog objects
 (the throwaway schema/table/functions and the `abac_migration_col_id`
 governed tag) were torn down at the end of the spike; nothing was left
 behind in `uc_source`.
+
+**§7.4 point 6 addendum (2026-09-28, executed against `ril_catalog_test_pat`
+/ workspace `adb-7405616318078204`), in two passes:**
+
+1. A raw-API-mechanics pass (direct HTTP calls, no `abac_migration` code
+   involved) confirmed the exact request/response shapes documented in
+   §13's new rows and §7.4 point 6 — the `/api/2.1/tag-policies/{tag_key}`
+   path, the `etag=""`-for-first-read requirement, the full-replace `PUT`
+   semantics, server-side grant de-duplication, and the clean
+   `400 BAD_REQUEST "ServicePrincipal ... not found"` error mode.
+2. A full-feature pass (`abac_migration/spike/test_tag_grant_full_feature_live.py`)
+   exercised the actual production code path end to end — a real
+   `ResilientDatabricksSQL` executor → `DatabricksUnityCatalogGateway`
+   (confirming `_ac_client` is built with zero extra wiring from the
+   executor's plain `.host`/`.token`) → `TagProvisioner.prepare()` with
+   `tag_grantee_principals` configured — against a real throwaway table in
+   `ril_full_access_test.hr`. Confirmed: (a) a newly-minted governed tag is
+   granted to the real SPN `b2dbcc98-7d9f-467d-a7b1-e8a026f94b73` in the
+   same `prepare()` call that mints it (`TagGrantResult(status="GRANTED")`),
+   independently re-verified via a direct `GET` on the live rule set; (b) a
+   second `prepare()` call against the exact same request REUSES the tag
+   (not re-minted) and still re-grants it, resolving to
+   `status="ALREADY_GRANTED"` — the self-healing/idempotent behavior
+   required by design is real, not just unit-tested against the fake
+   gateway. Both governed tag and throwaway table were torn down at the
+   end; nothing left behind in `ril_full_access_test`.

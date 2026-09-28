@@ -97,3 +97,49 @@ def test_tag_team_prefix_parses_from_widget_string():
         "audit_schema": "audit_sch", "tag_team_prefix": "mobility",
     })
     assert config.tag_team_prefix == "mobility"
+
+
+# ---------------------------------------------------------------------------
+# tag_grantee_principals / tag_grantee_role (§7.4 point 6): grants a
+# configured account role to a list of principals on every governed tag
+# this run creates/reuses. Empty principals list by default -> feature off,
+# no behavior/latency change at all (see tag_provisioner.py).
+# ---------------------------------------------------------------------------
+
+def test_tag_grantee_principals_defaults_to_empty_list():
+    config = RunConfig(scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s")
+    assert config.tag_grantee_principals == []
+
+
+def test_tag_grantee_role_defaults_to_assign():
+    config = RunConfig(scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s")
+    assert config.tag_grantee_role == "ASSIGN"
+
+
+def test_tag_grantee_principals_parses_json_list_from_widget_string():
+    config = load_from_dict({
+        "mode": "APPLY_ABAC", "scope_type": "ALL_CATALOGS", "audit_catalog": "audit_cat",
+        "audit_schema": "audit_sch",
+        "tag_grantee_principals": '["b2dbcc98-7d9f-467d-a7b1-e8a026f94b73", "groups/data-platform"]',
+    })
+    assert config.tag_grantee_principals == ["b2dbcc98-7d9f-467d-a7b1-e8a026f94b73", "groups/data-platform"]
+
+
+def test_tag_grantee_role_accepts_manage_and_normalizes_case():
+    config = RunConfig(
+        scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s", tag_grantee_role="manage",
+    )
+    assert config.tag_grantee_role == "MANAGE"  # normalized to upper-case
+
+
+def test_tag_grantee_role_rejects_unknown_value():
+    with pytest.raises(ConfigError):
+        RunConfig(
+            scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s",
+            tag_grantee_role="OWNER",  # not one of ASSIGN/MANAGE
+        )
+
+
+def test_tag_grants_table_fqn_defaults_alongside_other_audit_tables():
+    config = RunConfig(scope_type=ScopeType.ALL_CATALOGS, audit_catalog="c", audit_schema="s")
+    assert config.tag_grants_table_fqn == f"{config.audit_full_schema}.tag_grants"

@@ -104,6 +104,54 @@ _MIGRATION_AUDIT_EXPECTED_COLUMNS = [
 ]
 
 
+# §7.4 point 6: tag grants are TAG-scoped, not table-scoped (one governed
+# tag is very commonly shared by many tables' columns), so they don't fit
+# MIGRATION_AUDIT_TABLE_DDL's per-table/per-object row shape at all - a
+# dedicated, much narrower append-only table instead. One row per DISTINCT
+# tag_key per `TagProvisioner.prepare()` call that had `tag_grantee_principals`
+# configured (see tag_provisioner.py's `_grant_to_configured_principals`) -
+# not one row per column/table that tag happens to cover.
+TAG_GRANT_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS {fqn} (
+  run_id STRING,
+  tag_key STRING,
+  principals ARRAY<STRING>,
+  role STRING,
+  status STRING,
+  error_code STRING,
+  error_message STRING,
+  dry_run BOOLEAN,
+  granted_at TIMESTAMP
+) USING DELTA
+""".strip()
+
+_TAG_GRANT_EXPECTED_COLUMNS = [
+    ("run_id", "STRING"), ("tag_key", "STRING"), ("principals", "ARRAY<STRING>"), ("role", "STRING"),
+    ("status", "STRING"), ("error_code", "STRING"), ("error_message", "STRING"),
+    ("dry_run", "BOOLEAN"), ("granted_at", "TIMESTAMP"),
+]
+
+
+@dataclass(frozen=True)
+class TagGrantAuditRecord:
+    run_id: str
+    tag_key: str
+    principals: list
+    role: str
+    status: str
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    dry_run: bool = True
+    granted_at: Optional[dt.datetime] = None
+
+    def as_row_dict(self) -> dict:
+        return {
+            "run_id": self.run_id, "tag_key": self.tag_key, "principals": self.principals, "role": self.role,
+            "status": self.status, "error_code": self.error_code, "error_message": self.error_message,
+            "dry_run": self.dry_run, "granted_at": self.granted_at or dt.datetime.utcnow(),
+        }
+
+
 def _existing_columns(uc: UnityCatalogGateway, fqn: str) -> Optional[set]:
     """None means "table doesn't exist yet" (fresh deploy, or its own
     `CREATE TABLE IF NOT EXISTS` was itself skipped under dry_run) - treated
@@ -205,6 +253,7 @@ class AuditRepository:
         audit_table_fqn: str,
         inventory_table_fqn: str,
         latest_status_view_fqn: Optional[str] = None,
+        tag_grants_table_fqn: Optional[str] = None,
     ):
         self._uc = uc
         self._audit_full_schema = audit_full_schema
@@ -213,11 +262,16 @@ class AuditRepository:
         # Defaults to `<audit_schema>.migration_audit_latest` alongside the
         # base table, unless a caller overrides it.
         self._latest_status_view_fqn = latest_status_view_fqn or f"{audit_full_schema}.migration_audit_latest"
+        # §7.4 point 6 - defaults to `<audit_schema>.tag_grants` alongside
+        # the other 2 audit tables, unless a caller overrides it (see
+        # RunConfig.tag_grants_table_fqn).
+        self._tag_grants_table_fqn = tag_grants_table_fqn or f"{audit_full_schema}.tag_grants"
 
     def ensure_tables_exist(self, dry_run: bool = False) -> None:
         self._uc.run_sql(f"CREATE SCHEMA IF NOT EXISTS {self._audit_full_schema}", dry_run=dry_run)
         self._uc.run_sql(INVENTORY_TABLE_DDL.format(fqn=self._inventory_table_fqn), dry_run=dry_run)
         self._uc.run_sql(MIGRATION_AUDIT_TABLE_DDL.format(fqn=self._audit_table_fqn), dry_run=dry_run)
+        self._uc.run_sql(TAG_GRANT_TABLE_DDL.format(fqn=self._tag_grants_table_fqn), dry_run=dry_run)
         # `CREATE TABLE IF NOT EXISTS` above is a no-op against tables that
         # already existed with an older/narrower schema (e.g. this exact
         # audit_catalog/audit_schema reused across many earlier test runs,
@@ -227,6 +281,7 @@ class AuditRepository:
         # UNRESOLVED_COLUMN.
         _add_missing_columns(self._uc, self._inventory_table_fqn, _INVENTORY_EXPECTED_COLUMNS, dry_run)
         _add_missing_columns(self._uc, self._audit_table_fqn, _MIGRATION_AUDIT_EXPECTED_COLUMNS, dry_run)
+        _add_missing_columns(self._uc, self._tag_grants_table_fqn, _TAG_GRANT_EXPECTED_COLUMNS, dry_run)
         # CREATE OR REPLACE so the view's definition self-heals if this
         # module's DDL changes later - re-running is always safe/idempotent.
         # Skipped under dry_run like everything else here (§ dry_run gates
@@ -263,3 +318,10 @@ class AuditRepository:
 
     def rows_for_run(self, run_id: str) -> list:
         return self._uc.run_sql(f"SELECT * FROM {self._audit_table_fqn} WHERE run_id = '{run_id}'")
+
+    def append_tag_grant(self, record: TagGrantAuditRecord, dry_run: bool = False) -> None:
+        row = record.as_row_dict()
+        columns = ", ".join(row.keys())
+        values = ", ".join(sql_literal(v) for v in row.values())
+        statement = f"INSERT INTO {self._tag_grants_table_fqn} ({columns}) VALUES ({values})"
+        self._uc.run_sql(statement, dry_run=dry_run)

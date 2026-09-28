@@ -128,6 +128,39 @@ variables:
       Inventory -> Apply-ABAC -> Finalize for one migration, same rule as
       policy_scope.
     default: ""
+  tag_grantee_principals:
+    description: >-
+      JSON list of principals (typically one service principal, but also
+      accepts groups/users) granted access on EVERY governed tag the
+      mutating jobs (abac_migration_job, abac_migration_apply_abac_job)
+      create/reuse - so that identity can itself attach those tags
+      (`ALTER TABLE ... SET TAGS (...)`, subject to separately holding
+      `APPLY TAG` on the target object) or reference them by key in its own
+      functions/policies (`has_tag('key')`/`has_tag_value('key','v')`).
+      Each entry is either a bare service-principal application ID (a
+      UUID, e.g. '"b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"' - auto-prefixed
+      "servicePrincipals/") or an already fully-qualified principal string
+      ('"servicePrincipals/<id>"', '"groups/<name>"', '"users/<email>"').
+      Re-granted on every run for every tag touched - newly minted OR
+      reused - so it self-heals even for tags minted before this parameter
+      was configured. This is real REST (Account Access Control Proxy),
+      NOT SQL - there is no `GRANT ... ON GOVERNED TAG` statement (see
+      DESIGN.md §7.4 point 6 / abac_migration/uc_gateway/access_control_client.py).
+      A grant failure (e.g. principal not found) never aborts the run -
+      recorded as a FAILED row in the `tag_grants` audit table instead.
+      Empty (the default): feature off, zero grant calls, zero
+      behavior/latency change.
+    default: "[]"
+  tag_grantee_role:
+    description: >-
+      Account role granted to every `tag_grantee_principals` entry.
+      Accepted values (case-insensitive): "ASSIGN" (the default) - resolves
+      to account role `roles/tagPolicy.assigner`, attach/use the tag only,
+      cannot edit its allowed values or delete it; "MANAGE" - resolves to
+      `roles/tagPolicy.manager`, full control of the tag policy (edit
+      values, delete, re-grant to others). Any other value is a
+      ConfigError at startup, never silently ignored.
+    default: "ASSIGN"
 
 targets:
   source:

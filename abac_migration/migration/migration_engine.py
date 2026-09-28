@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-from ..audit.audit_repository import AuditRepository, MigrationAuditRecord
+from ..audit.audit_repository import AuditRepository, MigrationAuditRecord, TagGrantAuditRecord
 from ..config.models import Mode, PolicyScope, RunConfig
 from ..inventory.inventory_manager import build_inventory_record
 from ..inventory.inventory_repository import InventoryRepository
@@ -75,7 +75,10 @@ def run(config: RunConfig, uc: UnityCatalogGateway) -> RunSummary:
         summary.pre_validation_errors = pre.errors
         return summary
 
-    audit_repo = AuditRepository(uc, config.audit_full_schema, config.audit_table_fqn, config.inventory_table_fqn)
+    audit_repo = AuditRepository(
+        uc, config.audit_full_schema, config.audit_table_fqn, config.inventory_table_fqn,
+        tag_grants_table_fqn=config.tag_grants_table_fqn,
+    )
     audit_repo.ensure_tables_exist(dry_run=config.dry_run)
     inventory_repo = InventoryRepository(uc, config.inventory_table_fqn)
 
@@ -112,7 +115,7 @@ def run(config: RunConfig, uc: UnityCatalogGateway) -> RunSummary:
         TableRef(r.catalog, r.schema, r.table) for r in inventory_records if r.migration_eligibility == "ELIGIBLE"
     ]
     phase = _PHASE_BY_MODE.get(config.mode, "FULL")
-    results = _run_migration(config, eligible_tables, uc, strategy, phase=phase)
+    results = _run_migration(config, eligible_tables, uc, strategy, audit_repo, phase=phase)
     summary.conversion_results = results
 
     # NOTE: conversion itself already ran fully in parallel above - with
@@ -147,7 +150,8 @@ _PHASE_BY_MODE = {
 
 
 def _run_migration(
-    config: RunConfig, eligible_tables: list, uc: UnityCatalogGateway, strategy: PolicyStrategy, phase: str = "FULL",
+    config: RunConfig, eligible_tables: list, uc: UnityCatalogGateway, strategy: PolicyStrategy,
+    audit_repo: AuditRepository, phase: str = "FULL",
 ) -> list:
     """Serialized 'Prepare Governed Tags' phase (§3, §7.4) BEFORE the
     parallel per-table dispatch - this is what avoids the read-modify-write
@@ -171,8 +175,10 @@ def _run_migration(
         if all_tag_requests:
             provisioner = TagProvisioner(
                 uc, prefer_existing_tags=config.prefer_existing_tags, team_prefix=config.tag_team_prefix,
+                tag_grantee_principals=config.tag_grantee_principals, tag_grantee_role=config.tag_grantee_role,
             )
             resolved = provisioner.prepare(all_tag_requests, dry_run=config.dry_run)
+            _persist_tag_grants(audit_repo, config, provisioner.last_tag_grants)
 
     results = [None] * len(eligible_tables)
     with ThreadPoolExecutor(max_workers=max(1, config.max_parallelism)) as pool:
@@ -187,6 +193,23 @@ def _run_migration(
             idx = future_to_idx[future]
             results[idx] = future.result()
     return results
+
+
+def _persist_tag_grants(audit_repo: AuditRepository, config: RunConfig, tag_grants: list) -> None:
+    """§7.4 point 6 - one `tag_grants` audit row per TagGrantResult
+    `TagProvisioner.prepare()` produced this run (already deduplicated to
+    one per distinct tag_key by `_grant_to_configured_principals` - see its
+    docstring). No-op when `tag_grantee_principals` wasn't configured
+    (`tag_grants` is simply `[]` then)."""
+    for grant in tag_grants:
+        audit_repo.append_tag_grant(
+            TagGrantAuditRecord(
+                run_id=config.run_id, tag_key=grant.tag_key, principals=grant.principals, role=grant.role,
+                status=grant.status, error_code=grant.error_code, error_message=grant.error_message,
+                dry_run=config.dry_run,
+            ),
+            dry_run=config.dry_run,
+        )
 
 
 def _persist_conversion_result(audit_repo: AuditRepository, config: RunConfig, table: TableRef, result: ConversionResult) -> None:

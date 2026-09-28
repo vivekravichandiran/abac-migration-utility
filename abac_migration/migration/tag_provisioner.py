@@ -135,6 +135,38 @@ class TagRequest:
 
 TagResolutionKey = tuple  # (TableRef, str, str) - kept as plain tuple for hashability
 
+# §7.4 point 6: the only 2 account roles this tool ever grants on a governed
+# tag - "ASSIGN" (attach/use only) or "MANAGE" (full control) - see
+# config/models.py's RunConfig.tag_grantee_role / VALID_TAG_GRANTEE_ROLES,
+# which is validated against exactly these 2 keys (case-insensitive,
+# normalized to upper-case) before ever reaching this module. Confirmed
+# live (2026-09-28) against the real Account Access Control Proxy API - see
+# uc_gateway/access_control_client.py's module docstring.
+TAG_GRANT_ROLE_BY_NAME = {
+    "ASSIGN": "roles/tagPolicy.assigner",
+    "MANAGE": "roles/tagPolicy.manager",
+}
+
+# A service-principal application ID is always a UUID (confirmed by every
+# SPN this project has looked up via SCIM - see spike scripts). Anything
+# else in `tag_grantee_principals` is assumed to already be a fully-
+# qualified principal string ("groups/<name>", "users/<email>", or an
+# already-prefixed "servicePrincipals/<id>") and passed through unchanged -
+# this is what lets the common case (paste a bare SPN application ID) stay
+# simple while the list still accepts any principal type.
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def normalize_principal(raw: str) -> str:
+    """Turns a bare SPN application-ID UUID into 'servicePrincipals/<id>';
+    passes through anything already fully-qualified (contains a '/') or
+    that doesn't look like a UUID at all - see module comment above."""
+    if "/" in raw:
+        return raw  # already fully-qualified (servicePrincipals/... | groups/... | users/...)
+    if _UUID_RE.match(raw):
+        return f"servicePrincipals/{raw}"
+    return raw
+
 
 def _alias_for(column: str) -> str:
     # Aliases just need to be valid SQL identifiers; prefixing avoids any
@@ -224,7 +256,14 @@ def tag_key_for_function(
 
 
 class TagProvisioner:
-    def __init__(self, uc: UnityCatalogGateway, prefer_existing_tags: bool = True, team_prefix: str = ""):
+    def __init__(
+        self,
+        uc: UnityCatalogGateway,
+        prefer_existing_tags: bool = True,
+        team_prefix: str = "",
+        tag_grantee_principals: Optional[list] = None,
+        tag_grantee_role: str = "ASSIGN",
+    ):
         self._uc = uc
         self._prefer_existing_tags = prefer_existing_tags
         # Threaded into every tag_key_for_function() call below when minting
@@ -233,9 +272,15 @@ class TagProvisioner:
         # matches on whatever key is already assigned to the column, whatever
         # prefix it was minted with).
         self._team_prefix = team_prefix
+        # §7.4 point 6: pre-normalized once here (not per-tag in prepare())
+        # since it never varies across the tags one prepare() call touches.
+        # Empty by default: no grant calls at all, zero behavior change.
+        self._tag_grantee_principals = [normalize_principal(p) for p in (tag_grantee_principals or [])]
+        self._tag_grantee_role = TAG_GRANT_ROLE_BY_NAME[tag_grantee_role.upper()]
         # Introspection-only (see prepare() docstring) - re-populated fresh
         # on every prepare() call, never accumulated across calls.
         self.last_row_filter_collisions: list = []
+        self.last_tag_grants: list = []
 
     def prepare(self, requests: list, dry_run: bool = False) -> dict:
         """Resolves every TagRequest to a MatchColumn, minting governed tags
@@ -251,8 +296,14 @@ class TagProvisioner:
         a crash). Also populates `self.last_row_filter_collisions` (list of
         skipped TagRequests from this call, reset on every `prepare()` call)
         purely for introspection/testing - not consulted by any production
-        code path."""
+        code path. §7.4 point 6: if `tag_grantee_principals` was configured,
+        also populates `self.last_tag_grants` (list of TagGrantResult) - one
+        per DISTINCT tag_key this call resolved to (newly minted OR reused;
+        both re-granted every call, self-healing/idempotent - see
+        `_grant_to_configured_principals`'s docstring), never once per
+        column/request."""
         self.last_row_filter_collisions: list = []
+        self.last_tag_grants: list = []
         if not requests:
             return {}
 
@@ -275,7 +326,27 @@ class TagProvisioner:
         if to_mint:
             self._mint_and_assign(to_mint, governed_tags, resolved, dry_run, table_tags_cache)
 
+        if self._tag_grantee_principals:
+            self._grant_to_configured_principals(resolved, dry_run)
+
         return resolved
+
+    def _grant_to_configured_principals(self, resolved: dict, dry_run: bool) -> None:
+        """Grants `self._tag_grantee_role` on every DISTINCT governed tag
+        `resolved` touched (newly minted OR reused - deliberately not just
+        newly-minted ones, so a tag minted by an earlier run, before this
+        parameter existed/changed, gets self-healed too) to
+        `self._tag_grantee_principals`. One REST round trip per distinct
+        tag_key, never per column/request - many `resolved` entries usually
+        share one tag_key. Never raises: `uc.grant_tag_principals` already
+        converts any failure into a FAILED TagGrantResult (§7.4 point 6) -
+        a grant failure must never abort a table's migration."""
+        distinct_tag_keys = sorted({mc.tag_key for mc in resolved.values()})
+        for tag_key in distinct_tag_keys:
+            result = self._uc.grant_tag_principals(
+                tag_key, self._tag_grantee_principals, self._tag_grantee_role, dry_run=dry_run,
+            )
+            self.last_tag_grants.append(result)
 
     def _find_reusable_tag(
         self, request: TagRequest, table_tags: list, governed_tags: dict

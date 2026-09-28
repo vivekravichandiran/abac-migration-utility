@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from .access_control_client import AccessControlClientError, AccessControlProxyClient
 from .models import (
     ColumnMaskInfo,
     ColumnTagAssignment,
@@ -29,6 +30,7 @@ from .models import (
     RowFilterInfo,
     TableRef,
     TableSecurityState,
+    TagGrantResult,
     quote_fqn,
     quote_ident,
 )
@@ -204,6 +206,18 @@ class UnityCatalogGateway(Protocol):
     def set_column_tags(
         self, table: TableRef, column: str, tags: dict, dry_run: bool, table_type: str = "MANAGED",
     ) -> None: ...
+    # Grants tag-policy access on ONE governed tag to a list of already-
+    # fully-qualified principals (§7.4 point 6) - NOT SQL, goes through the
+    # Account Access Control Proxy REST API (access_control_client.py) since
+    # there is no `GRANT ... ON GOVERNED TAG` statement. `role` is the
+    # account-role string (e.g. "roles/tagPolicy.assigner"), never the bare
+    # "ASSIGN"/"MANAGE" config value - callers resolve that via
+    # tag_provisioner.TAG_GRANT_ROLE_BY_NAME first. Never raises - failures
+    # come back as TagGrantResult(status="FAILED", ...) so one bad grant
+    # never aborts a migration run.
+    def grant_tag_principals(
+        self, tag_key: str, principals: list, role: str, dry_run: bool,
+    ) -> "TagGrantResult": ...
 
     # LLM-assisted PII classification (INVENTORY-only, advisory)
     def suggest_pii_tag(self, function_fqn: str, columns: list, endpoint: str) -> "PiiSuggestion": ...
@@ -264,6 +278,18 @@ class DatabricksUnityCatalogGateway:
     def __init__(self, executor: SqlExecutor, retry_policy: Optional[RetryPolicy] = None):
         self._executor = executor
         self._retry_policy = retry_policy or RetryPolicy()
+        # Account Access Control Proxy calls (§7.4 point 6, grant_tag_principals
+        # below) need a plain host+token, not a SqlExecutor - every real
+        # executor in this project (ResilientDatabricksSQL, in every
+        # notebook/spike, see sql_statement_client.py) already carries both
+        # as plain attributes, so this is built for free with no new
+        # constructor parameter/wiring anywhere else. Left as None (feature
+        # silently unavailable, only reachable if tag_grantee_principals is
+        # configured) for any executor shape that doesn't have them - e.g.
+        # a hypothetical future spark.sql-backed executor, or a test double.
+        host = getattr(executor, "host", None)
+        token = getattr(executor, "token", None)
+        self._ac_client = AccessControlProxyClient(host, token, retry_policy) if host and token else None
 
     # -- low-level helpers ---------------------------------------------
 
@@ -556,6 +582,33 @@ class DatabricksUnityCatalogGateway:
         if dry_run:
             return
         self._execute(statement)
+
+    def grant_tag_principals(
+        self, tag_key: str, principals: list, role: str, dry_run: bool,
+    ) -> TagGrantResult:
+        # §7.4 point 6: real REST (Account Access Control Proxy), not SQL -
+        # see access_control_client.py's module docstring for the confirmed-
+        # live mechanics. `dry_run` short-circuits before any network call,
+        # same posture as every mutating method above.
+        if dry_run:
+            return TagGrantResult(tag_key=tag_key, principals=principals, role=role, status="WOULD_GRANT")
+        if self._ac_client is None:
+            return TagGrantResult(
+                tag_key=tag_key, principals=principals, role=role, status="FAILED",
+                error_code="ACCESS_CONTROL_CLIENT_UNAVAILABLE",
+                error_message=(
+                    "This gateway's executor has no host/token (see __init__) - "
+                    "tag-policy grants require a real REST-capable executor."
+                ),
+            )
+        try:
+            status = self._ac_client.grant_tag_role(tag_key, principals, role)
+            return TagGrantResult(tag_key=tag_key, principals=principals, role=role, status=status)
+        except AccessControlClientError as exc:
+            return TagGrantResult(
+                tag_key=tag_key, principals=principals, role=role, status="FAILED",
+                error_code=exc.error_code, error_message=exc.message,
+            )
 
     def alter_governed_tag_set_values(self, tag_key: str, values: list, dry_run: bool) -> None:
         # §7.4 point 3: this is a full-replace, not additive - callers must

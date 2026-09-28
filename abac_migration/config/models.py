@@ -60,6 +60,31 @@ class PolicyScope(str, Enum):
 
 DEFAULT_POLICY_TO_PRINCIPALS = ["account users"]
 DEFAULT_POLICY_EXCEPT_PRINCIPALS: list = []
+# Principals (typically one SPN, but a list to allow a group or several
+# SPNs) granted access on every governed tag this run creates/reuses, so
+# that identity can itself later attach those tags to objects (`ALTER TABLE
+# ... SET TAGS (...)`, subject to also holding `APPLY TAG` on the specific
+# target object - a separate, per-object grant this tool does not and
+# cannot control, see DESIGN.md §7.4 point 6) or reference them by key in
+# its own functions/policies (`has_tag('key')`/`has_tag_value('key','v')`).
+# Empty by default: no grant calls at all, zero behavior/latency change.
+# Each entry is either a bare service-principal application ID (a UUID,
+# auto-prefixed "servicePrincipals/") or an already-fully-qualified
+# principal string ("servicePrincipals/<id>", "groups/<name>",
+# "users/<email>") for the two rarer cases - see
+# tag_provisioner.normalize_principal().
+DEFAULT_TAG_GRANTEE_PRINCIPALS: list = []
+# "ASSIGN" (-> account role `roles/tagPolicy.assigner`): can attach/use the
+# tag, cannot edit its allowed values or delete it - the minimum needed for
+# the use case above, and the default.
+# "MANAGE" (-> account role `roles/tagPolicy.manager`): full control over
+# the tag policy itself (edit values, delete, re-grant to others) - only
+# needed if the grantee is meant to co-administer the tag, not just use it.
+# Case-insensitive on input, normalized to upper-case; validated in
+# _validate() below - any other value is a ConfigError, never silently
+# ignored. See tag_provisioner.TAG_GRANT_ROLE_BY_NAME for the exact mapping.
+DEFAULT_TAG_GRANTEE_ROLE = "ASSIGN"
+VALID_TAG_GRANTEE_ROLES = frozenset({"ASSIGN", "MANAGE"})
 # Optional namespace segment inserted into every governed tag KEY this run
 # mints (tag_provisioner.py tag_key_for_function) - and, under
 # PolicyScope.CATALOG, into every ABAC policy name too, since
@@ -101,6 +126,7 @@ class RunConfig:
     audit_schema: str = ""
     audit_table: str = "migration_audit"
     inventory_table: str = "inventory"
+    tag_grants_table: str = "tag_grants"
 
     policy_scope: PolicyScope = PolicyScope.TABLE
     policy_to_principals: list = field(default_factory=lambda: list(DEFAULT_POLICY_TO_PRINCIPALS))
@@ -121,6 +147,8 @@ class RunConfig:
     # Finalize for one migration, same rule as policy_scope.
     tag_team_prefix: str = DEFAULT_TAG_TEAM_PREFIX
     prefer_existing_tags: bool = True
+    tag_grantee_principals: list = field(default_factory=lambda: list(DEFAULT_TAG_GRANTEE_PRINCIPALS))
+    tag_grantee_role: str = DEFAULT_TAG_GRANTEE_ROLE
 
     # INVENTORY-only: best-effort LLM classification of each legacy row-filter
     # /column-mask function's likely PII category, from its name + governed
@@ -135,6 +163,8 @@ class RunConfig:
     def __post_init__(self):
         if not self.run_id:
             object.__setattr__(self, "run_id", str(uuid.uuid4()))
+        if self.tag_grantee_role:
+            object.__setattr__(self, "tag_grantee_role", self.tag_grantee_role.upper())
         self._validate()
 
     def _validate(self) -> None:
@@ -162,6 +192,13 @@ class RunConfig:
         if self.mode == Mode.ROLLBACK and not self.run_id:
             raise ConfigError("ROLLBACK mode requires a run_id identifying the run to roll back")
 
+        if self.tag_grantee_role.upper() not in VALID_TAG_GRANTEE_ROLES:
+            raise ConfigError(
+                f"tag_grantee_role must be one of {sorted(VALID_TAG_GRANTEE_ROLES)} (got "
+                f"{self.tag_grantee_role!r}) - 'ASSIGN' grants roles/tagPolicy.assigner (attach/use "
+                "only, the default), 'MANAGE' grants roles/tagPolicy.manager (full control)."
+            )
+
     @property
     def audit_full_schema(self) -> str:
         return f"{self.audit_catalog}.{self.audit_schema}"
@@ -173,6 +210,10 @@ class RunConfig:
     @property
     def inventory_table_fqn(self) -> str:
         return f"{self.audit_full_schema}.{self.inventory_table}"
+
+    @property
+    def tag_grants_table_fqn(self) -> str:
+        return f"{self.audit_full_schema}.{self.tag_grants_table}"
 
     @classmethod
     def from_dict(cls, raw: dict) -> "RunConfig":
@@ -200,6 +241,9 @@ class RunConfig:
         )
         data["policy_except_principals"] = _maybe_json(
             data.get("policy_except_principals"), list(DEFAULT_POLICY_EXCEPT_PRINCIPALS)
+        )
+        data["tag_grantee_principals"] = _maybe_json(
+            data.get("tag_grantee_principals"), list(DEFAULT_TAG_GRANTEE_PRINCIPALS)
         )
 
         if "mode" in data and not isinstance(data["mode"], Mode):

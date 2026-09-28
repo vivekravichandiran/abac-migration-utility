@@ -16,6 +16,7 @@ from ..uc_gateway.models import (
     RowFilterInfo,
     TableRef,
     TableSecurityState,
+    TagGrantResult,
 )
 
 # Deterministic keyword->tag mapping used by the fake's suggest_pii_tag(),
@@ -80,6 +81,14 @@ class FakeUnityCatalogGateway:
         self._raise_on = {}
         self._create_policy_failure = None  # (error_code, error_message) or None
         self._describe_policy_override = {}
+        # §7.4 point 6 test fixtures: {tag_key: [(principal, role), ...]} -
+        # mirrors the real Account Access Control Proxy's grant_rules
+        # (flattened to one (principal, role) pair per entry rather than the
+        # real API's {principals: [...], role} grouping, since nothing in
+        # this fake or its tests needs to assert on the grouping itself).
+        self.tag_grants = {}
+        self.grant_tag_principals_calls = []
+        self._grant_tag_principals_failure = None  # (error_code, error_message) or None
 
     # -- test-only setup helpers ------------------------------------------
 
@@ -134,6 +143,9 @@ class FakeUnityCatalogGateway:
 
     def fail_next_create_policy(self, error_code: str = "POLICY_CREATE_FAILED", error_message: str = "injected failure") -> None:
         self._create_policy_failure = (error_code, error_message)
+
+    def fail_next_grant_tag_principals(self, error_code: str = "GRANT_FAILED", error_message: str = "injected failure") -> None:
+        self._grant_tag_principals_failure = (error_code, error_message)
 
     def override_describe_policy(self, on_securable, policy_name: str, policy_def: PolicyDefinition) -> None:
         """`on_securable` accepts either the strategy-style string (e.g.
@@ -324,6 +336,27 @@ class FakeUnityCatalogGateway:
         for key, value in tags.items():
             remaining.append(ColumnTagAssignment(column=column, tag_key=key, tag_value=value))
         self.column_tags[table.full_name] = remaining
+
+    def grant_tag_principals(self, tag_key: str, principals: list, role: str, dry_run: bool) -> TagGrantResult:
+        self.grant_tag_principals_calls.append((tag_key, tuple(principals), role, dry_run))
+        if dry_run:
+            return TagGrantResult(tag_key=tag_key, principals=principals, role=role, status="WOULD_GRANT")
+        if self._grant_tag_principals_failure is not None:
+            error_code, error_message = self._grant_tag_principals_failure
+            self._grant_tag_principals_failure = None
+            return TagGrantResult(
+                tag_key=tag_key, principals=principals, role=role, status="FAILED",
+                error_code=error_code, error_message=error_message,
+            )
+        existing = self.tag_grants.setdefault(tag_key, [])
+        already_present = all((p, role) in existing for p in principals)
+        for p in principals:
+            if (p, role) not in existing:
+                existing.append((p, role))
+        return TagGrantResult(
+            tag_key=tag_key, principals=principals, role=role,
+            status="ALREADY_GRANTED" if already_present else "GRANTED",
+        )
 
     def run_sql(self, statement: str, dry_run: bool = False) -> list:
         self.generic_sql_log.append(statement)

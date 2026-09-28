@@ -152,6 +152,73 @@ already wired into `abac_migration_job` and all three phased jobs
 (`resources/jobs.yml` / `resources/phased_jobs.yml`) — override it per
 target/team, or pass it at "Run now with different parameters".
 
+### 2.4 Granting a service principal access to every governed tag: `tag_grantee_principals` / `tag_grantee_role`
+
+Every governed tag this tool creates is, by default, usable only by
+whoever/whatever created it (this tool's own executor identity) and
+account admins. If a *different* identity — typically a **service
+principal** running some other pipeline or policy that needs to
+`ALTER TABLE ... SET TAGS (...)` with one of these tags, or reference one
+by key in its own function (`has_tag('key')` / `has_tag_value('key','v')`)
+— set **`tag_grantee_principals`** (JSON array, default `[]`) to grant it
+access on every governed tag this run creates **or reuses**:
+
+```json
+["b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"]
+```
+
+Accepted entry formats:
+
+| Form | Example | When to use |
+| --- | --- | --- |
+| Bare service-principal application ID (a UUID) | `"b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"` | The common case — auto-prefixed `servicePrincipals/` internally. |
+| Fully-qualified service principal | `"servicePrincipals/b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"` | Same as above, spelled out. |
+| Group | `"groups/data-platform"` | Grant to every member of an account group at once. |
+| User | `"users/someone@example.com"` | Rare — grant to one individual. |
+
+**`tag_grantee_role`** (default `"ASSIGN"`) picks how much access:
+
+| Value | Account role granted | Can do |
+| --- | --- | --- |
+| `"ASSIGN"` (default) | `roles/tagPolicy.assigner` | Attach/use the tag (`SET TAGS`, `has_tag(...)`) — cannot edit its allowed values or delete it. |
+| `"MANAGE"` | `roles/tagPolicy.manager` | Full control — everything `ASSIGN` can, plus edit allowed values, delete the tag, or grant/revoke other principals. |
+
+Case-insensitive on input (`"manage"` and `"MANAGE"` are equivalent);
+anything else raises a `ConfigError` at startup rather than being
+silently ignored.
+
+**Important — this is real REST, not SQL.** Every other operation in this
+tool is a plain SQL statement over the warehouse; granting tag-policy
+access has **no SQL grammar at all** (confirmed against Databricks docs
+and live). It goes through the account-level **Account Access Control
+Proxy API** instead (`abac_migration/uc_gateway/access_control_client.py`)
+— no extra OAuth scope needed beyond the plain workspace token this tool
+already uses everywhere else.
+
+Behavior notes:
+
+- **Self-healing, not one-shot.** Every run re-grants the configured role
+  to the configured principals on every governed tag it touches — newly
+  minted *or* reused — so a tag minted by an earlier run (before this
+  parameter existed, or with different grantees) gets healed too, and
+  re-running with an updated principal list simply adds the new grant
+  without disturbing any pre-existing one (server-side full-replace with a
+  client-side merge, confirmed idempotent — granting the same
+  (principal, role) pair twice is a safe no-op, not a duplicate).
+- **Never aborts a migration.** A grant failure (e.g. the configured SPN
+  doesn't actually exist in the account — a clean, catchable
+  `400 BAD_REQUEST "... not found"`, not a crash) is recorded as a
+  `FAILED` row in the `tag_grants` audit table (`<audit_schema>.tag_grants`)
+  and the table's own migration proceeds normally.
+- **Empty (the default) = feature fully off** — zero grant calls, zero
+  added latency, byte-for-byte unchanged behavior from before this option
+  existed.
+- The bundle's `tag_grantee_principals` / `tag_grantee_role` variables
+  (`databricks.yml`, defaults `"[]"` / `"ASSIGN"`) are already wired into
+  `abac_migration_job` and all three phased jobs (inert for `INVENTORY`/
+  `FINALIZE`, which never mint or grant a tag) — override per
+  target/team, or pass at "Run now with different parameters".
+
 ---
 
 ## 3. One-time setup (do this once per workspace)
@@ -711,6 +778,22 @@ SHOW POLICIES ON TABLE <catalog>.<schema>.<table>;    -- ABAC policies currently
 SHOW GOVERNED TAGS LIKE 'abac_%';                     -- governed tags this tool minted
 ```
 
+`tag_grantee_principals` (§2.4) results — one row per distinct tag_key per
+run that had it configured, not one row per column/table:
+
+```sql
+-- Every grant attempt from a given run, including any that failed
+SELECT tag_key, principals, role, status, error_code, error_message, granted_at
+FROM <audit_catalog>.<audit_schema>.tag_grants
+WHERE run_id = '<run_id>'
+ORDER BY granted_at;
+
+-- Any grant failures ever recorded (e.g. a configured SPN that doesn't
+-- exist in the account) - these never abort the table's own migration,
+-- so they're easy to miss unless you check this table directly
+SELECT * FROM <audit_catalog>.<audit_schema>.tag_grants WHERE status = 'FAILED';
+```
+
 ---
 
 ## 8. Recommended runbooks
@@ -753,6 +836,8 @@ Find its `run_id` in `migration_audit` → `ROLLBACK` with `dry_run=true`
 | `policy_except_principals` | mutating modes | `[]` | JSON list of users/groups/service principals to **exempt** from every ABAC policy this run creates (`TO ... EXCEPT <principal>`) — e.g. `["etl_service_principal"]`. Exempted principals see fully unmasked/unfiltered data. Empty = no exemptions (unchanged behavior) |
 | `tag_team_prefix` | mutating modes | `""` | namespaces every governed tag key AND every policy name (both `policy_scope`s) this run creates — see §2.3. Must be the same value across `INVENTORY` → `APPLY_ABAC` → `FINALIZE`, same rule as `policy_scope` |
 | `prefer_existing_tags` | mutating modes | `true` | reuse a compatible existing governed tag instead of minting a new one, if found |
+| `tag_grantee_principals` | mutating modes | `[]` | JSON list of principals (SPN app ID / `servicePrincipals\|groups\|users/...`) granted access on every governed tag this run creates/reuses — see §2.4. Empty = feature off |
+| `tag_grantee_role` | mutating modes | `ASSIGN` | `ASSIGN` (attach/use only) or `MANAGE` (full control) — see §2.4 |
 | `enable_llm_pii_tagging` | `INVENTORY` only | `false` | LLM-suggested PII category per legacy function — advisory only |
 | `pii_llm_endpoint` | `INVENTORY` only, when the above is `true` | `databricks-meta-llama-3-3-70b-instruct` | override if that model isn't enabled on your account |
 | `run_id` | `ROLLBACK` (required); optional elsewhere | auto-generated UUID | identifies the run to undo, for `ROLLBACK` |

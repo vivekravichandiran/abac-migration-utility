@@ -167,3 +167,16 @@ class ColumnTagAssignment:
     column: str
     tag_key: str
     tag_value: Optional[str]
+
+
+@dataclass(frozen=True)
+class TagGrantResult:
+    """Result of granting tag-policy access to one or more principals on
+    one governed tag (§7.4 point 6) - via the Account Access Control Proxy
+    API, NOT SQL (there is no `GRANT ... ON GOVERNED TAG` statement)."""
+    tag_key: str
+    principals: list  # the fully-qualified principal strings actually requested
+    role: str  # "roles/tagPolicy.assigner" | "roles/tagPolicy.manager"
+    status: str  # "GRANTED" | "ALREADY_GRANTED" | "WOULD_GRANT" (dry_run) | "FAILED"
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None

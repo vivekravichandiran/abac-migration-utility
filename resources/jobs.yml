@@ -28,7 +28,13 @@ resources:
         every governed tag key (and, under `policy_scope=CATALOG`, every
         policy name) this run mints, e.g. "mobility" ->
         `abac_colmask_mobility_<catalog>_<schema>_<function>` instead of
-        `abac_colmask_<catalog>_<schema>_<function>`.
+        `abac_colmask_<catalog>_<schema>_<function>`. Override
+        `tag_grantee_principals` (JSON array, default `[]`) to grant a
+        service principal (or group) access on every governed tag this run
+        creates/reuses, so it can attach/use those tags itself -
+        `tag_grantee_role` (default `ASSIGN`) picks assign-only vs. full
+        `MANAGE` control. Not SQL - real REST (Account Access Control
+        Proxy) - see DESIGN.md §7.4 point 6.
       max_concurrent_runs: 1
       # Serverless job compute: the notebook only makes Python/requests
       # calls against the SQL Statement Execution API, so it needs no
@@ -53,6 +59,8 @@ resources:
               policy_except_principals: ${var.policy_except_principals}
               tag_team_prefix: ${var.tag_team_prefix}
               prefer_existing_tags: "true"
+              tag_grantee_principals: ${var.tag_grantee_principals}
+              tag_grantee_role: ${var.tag_grantee_role}
           environment_key: default
       environments:
         - environment_key: default

@@ -59,6 +59,12 @@ security once you're confident the new ABAC policy is correct.
 | `RECONCILE` | yes | never | `migration_audit` (drift flags) | Compares the audit table's last-known-good state against live UC to catch drift (e.g. someone else deleted the policy, or manually restored the legacy filter) |
 | `ROLLBACK` | yes | yes (unless `dry_run=true`) | `migration_audit` | Undo one specific run: restores the original legacy row filter/masks and removes only the ABAC policies **that run** created |
 
+`MIGRATE`/`INVENTORY_AND_MIGRATE`/`APPLY_ABAC` additionally persist to a
+fourth table, **`tag_grants`**, whenever `tag_grantee_principals` (see
+below) is configured — one row per distinct governed tag key granted that
+run, omitted from the table above since it's off by default and a no-op
+write when it is.
+
 ### `INVENTORY`
 
 Read-only. Resolves scope, then for every table calls
@@ -217,6 +223,33 @@ it entirely — unchanged behavior. Must be the same value across
 `INVENTORY`/`APPLY_ABAC`/`FINALIZE` for one migration, same rule as
 `policy_scope` — see `abac_migration/DESIGN.md` §7.4 point 2a and `SOP.md`
 §2.3.
+
+### `tag_grantee_principals` / `tag_grantee_role`: granting an SPN access to every governed tag
+
+All mutating modes also read `tag_grantee_principals` (JSON list, default
+`[]`) and `tag_grantee_role` (`"ASSIGN"` | `"MANAGE"`, default `"ASSIGN"`).
+When non-empty, every governed tag a run creates **or reuses** is granted
+`tag_grantee_role` to every listed principal — typically one service
+principal that needs to itself `ALTER TABLE ... SET TAGS (...)` with one
+of these tags, or reference one by key in its own function
+(`has_tag('key')`/`has_tag_value('key','v')`). Each entry is either a bare
+service-principal application-ID UUID (auto-prefixed
+`servicePrincipals/`) or an already fully-qualified principal string
+(`"servicePrincipals/<id>"` / `"groups/<name>"` / `"users/<email>"`) — see
+`tag_provisioner.normalize_principal()`. `tag_grantee_role="ASSIGN"`
+resolves to account role `roles/tagPolicy.assigner` (attach/use only);
+`"MANAGE"` resolves to `roles/tagPolicy.manager` (full control — edit
+values, delete, re-grant). Re-granted on **every** run for every tag
+touched — newly minted or reused — so it self-heals even for tags minted
+before this parameter was configured; a grant failure (e.g. the SPN
+doesn't exist) is recorded in the new `tag_grants` audit table and never
+aborts the table's own migration. Empty (the default) is feature-off, zero
+grant calls. **This is the one part of this tool that is real REST, not
+SQL** — granting tag-policy access has no SQL grammar at all, so it goes
+through the account-level Account Access Control Proxy API
+(`uc_gateway/access_control_client.py`) instead of the SQL Statement
+Execution API every other operation uses. See `abac_migration/DESIGN.md`
+§7.4 point 6 and `SOP.md` §2.4.
 
 ### `VERIFY`
 

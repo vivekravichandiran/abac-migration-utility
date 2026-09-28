@@ -4,10 +4,12 @@ import pytest
 
 from ..migration.tag_provisioner import (
     SYNTHETIC_TAG_DESCRIPTION_TEMPLATE,
+    TAG_GRANT_ROLE_BY_NAME,
     TagKeyCollisionError,
     TagProvisioner,
     TagRequest,
     _short_function_name,
+    normalize_principal,
     tag_key_for_function,
 )
 from ..uc_gateway.models import TableRef
@@ -408,3 +410,203 @@ def test_long_or_unusual_function_name_produces_valid_truncated_key_with_no_hash
     assert len(tag_key) < 220
     assert tag_key in fake.governed_tags
     assert tag_key.startswith("abac_colmask_cat_sch_very_long_function_name_")
+
+
+# ---------------------------------------------------------------------------
+# tag_grantee_principals / tag_grantee_role (§7.4 point 6): grants a
+# configured account role to a list of principals on every governed tag a
+# `prepare()` call touches - newly minted OR reused. Not SQL (see
+# uc_gateway/access_control_client.py) - the fake gateway's
+# `grant_tag_principals()` is the seam every test below exercises.
+# ---------------------------------------------------------------------------
+
+SPN_1 = "b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"
+SPN_2 = "91f9bc02-aab4-4f58-b253-b98b3c676428"
+
+
+def test_normalize_principal_prefixes_bare_spn_uuid():
+    assert normalize_principal(SPN_1) == f"servicePrincipals/{SPN_1}"
+
+
+def test_normalize_principal_passes_through_already_qualified_strings():
+    assert normalize_principal(f"servicePrincipals/{SPN_1}") == f"servicePrincipals/{SPN_1}"
+    assert normalize_principal("groups/data-platform") == "groups/data-platform"
+    assert normalize_principal("users/someone@example.com") == "users/someone@example.com"
+
+
+def test_normalize_principal_passes_through_non_uuid_non_slash_strings_unchanged():
+    # Doesn't look like a UUID and has no "/" - passed through as-is rather
+    # than guessed at (e.g. a malformed config value surfaces downstream,
+    # at the real API, as a clean not-found error - not silently mangled here).
+    assert normalize_principal("not-a-uuid") == "not-a-uuid"
+
+
+def test_no_grantee_principals_configured_means_zero_grant_calls():
+    # Default/empty tag_grantee_principals: feature fully off, no behavior
+    # change whatsoever vs. every test above this section.
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake)
+    resolved = provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert resolved  # sanity: the tag was still minted
+    assert fake.grant_tag_principals_calls == []
+    assert provisioner.last_tag_grants == []
+
+
+def test_configured_grantee_principals_get_granted_on_newly_minted_tag():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1], tag_grantee_role="ASSIGN")
+    provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert fake.grant_tag_principals_calls == [
+        (RF_TAG_KEY, (f"servicePrincipals/{SPN_1}",), "roles/tagPolicy.assigner", False),
+    ]
+    assert len(provisioner.last_tag_grants) == 1
+    assert provisioner.last_tag_grants[0].tag_key == RF_TAG_KEY
+    assert provisioner.last_tag_grants[0].status == "GRANTED"
+
+
+def test_manage_role_resolves_to_tag_policy_manager():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1], tag_grantee_role="manage")  # lower-case input
+    provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert fake.grant_tag_principals_calls[0][2] == "roles/tagPolicy.manager"
+    assert TAG_GRANT_ROLE_BY_NAME["MANAGE"] == "roles/tagPolicy.manager"
+
+
+def test_reused_tag_also_gets_re_granted_every_call_self_healing():
+    # A tag minted by an earlier prepare() call (before tag_grantee_principals
+    # was configured, or with a different grantee) must still get granted
+    # once it's configured - reuse is not exempt.
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+    fake.register_governed_tag(RF_TAG_KEY)
+    fake.add_column_tag(table, "business_unit", RF_TAG_KEY, None)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    resolved = provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert resolved[(table, "business_unit", "row_filter")].tag_key == RF_TAG_KEY
+    assert fake.grant_tag_principals_calls == [
+        (RF_TAG_KEY, (f"servicePrincipals/{SPN_1}",), "roles/tagPolicy.assigner", False),
+    ]
+
+
+def test_multiple_columns_sharing_one_tag_key_grant_once_not_per_column():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    provisioner.prepare(
+        [
+            TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN),
+            TagRequest(table=TableRef("cat", "sch", "t2"), column="business_unit", role="row_filter", function_fqn=RF_FN),
+        ],
+        dry_run=False,
+    )
+
+    # Both columns resolve to the SAME tag_key (same function) - exactly one
+    # grant call, not two.
+    assert len(fake.grant_tag_principals_calls) == 1
+    assert len(provisioner.last_tag_grants) == 1
+
+
+def test_distinct_tag_keys_each_get_their_own_grant_call():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    provisioner.prepare(
+        [
+            TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN),
+            TagRequest(table=table, column="email", role="mask", function_fqn=MASK_FN),
+        ],
+        dry_run=False,
+    )
+
+    granted_keys = {call[0] for call in fake.grant_tag_principals_calls}
+    assert granted_keys == {RF_TAG_KEY, MASK_TAG_KEY}
+    assert len(provisioner.last_tag_grants) == 2
+
+
+def test_multiple_principals_all_passed_in_one_grant_call():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1, SPN_2, "groups/data-platform"])
+    provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    call = fake.grant_tag_principals_calls[0]
+    assert call[1] == (f"servicePrincipals/{SPN_1}", f"servicePrincipals/{SPN_2}", "groups/data-platform")
+
+
+def test_dry_run_still_reports_would_grant_without_mutating_fake_state():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=True,
+    )
+
+    assert provisioner.last_tag_grants[0].status == "WOULD_GRANT"
+    assert fake.tag_grants == {}  # dry_run: fake's grant call short-circuits before mutating state
+
+
+def test_grant_failure_is_non_fatal_and_recorded_as_failed():
+    # A grant failure (e.g. real API 400 "ServicePrincipal not found") must
+    # never abort resolution of the tag itself - resolved still contains the
+    # entry, just with a FAILED TagGrantResult alongside it.
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+    fake.fail_next_grant_tag_principals("SPN_NOT_FOUND", "ServicePrincipal not found")
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    resolved = provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+
+    assert resolved[(table, "business_unit", "row_filter")].tag_key == RF_TAG_KEY  # tag resolution unaffected
+    assert provisioner.last_tag_grants[0].status == "FAILED"
+    assert provisioner.last_tag_grants[0].error_code == "SPN_NOT_FOUND"
+
+
+def test_last_tag_grants_reset_on_every_prepare_call_not_accumulated():
+    fake = FakeUnityCatalogGateway()
+    table = TableRef("cat", "sch", "t1")
+    fake.register_table(table)
+
+    provisioner = TagProvisioner(fake, tag_grantee_principals=[SPN_1])
+    provisioner.prepare(
+        [TagRequest(table=table, column="business_unit", role="row_filter", function_fqn=RF_FN)], dry_run=False,
+    )
+    assert len(provisioner.last_tag_grants) == 1
+
+    provisioner.prepare([], dry_run=False)  # empty request list - short-circuits before the reset even matters
+    assert provisioner.last_tag_grants == []

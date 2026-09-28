@@ -20,11 +20,14 @@ WIDGET_NAMES = [
     "audit_schema",
     "audit_table",
     "inventory_table",
+    "tag_grants_table",
     "policy_scope",
     "policy_to_principals",
     "policy_except_principals",
     "tag_team_prefix",
     "prefer_existing_tags",
+    "tag_grantee_principals",
+    "tag_grantee_role",
     "enable_llm_pii_tagging",
     "pii_llm_endpoint",
     "run_id",
@@ -44,6 +47,7 @@ WIDGET_DEFAULTS = {
     "audit_schema": "",
     "audit_table": "migration_audit",
     "inventory_table": "inventory",
+    "tag_grants_table": "tag_grants",
     # "TABLE" ("table level application") | "CATALOG" ("catalog level
     # application") - see config/models.py PolicyScope / DESIGN.md §7.3.
     "policy_scope": "TABLE",
@@ -54,6 +58,16 @@ WIDGET_DEFAULTS = {
     # - see config/models.py RunConfig.tag_team_prefix / DESIGN.md §7.4.
     "tag_team_prefix": "",
     "prefer_existing_tags": "true",
+    # SPN application ID(s) (or, less commonly, "groups/<name>" /
+    # "users/<email>") to grant tag-policy access to for every governed tag
+    # this run creates/reuses - e.g. '["b2dbcc98-7d9f-467d-a7b1-e8a026f94b73"]'.
+    # Empty (default): feature off, no grant calls at all. See
+    # config/models.py RunConfig.tag_grantee_principals / DESIGN.md §7.4
+    # point 6.
+    "tag_grantee_principals": "[]",
+    # "ASSIGN" (attach/use only, the default) or "MANAGE" (full control of
+    # the tag policy) - see config/models.py VALID_TAG_GRANTEE_ROLES.
+    "tag_grantee_role": "ASSIGN",
     "enable_llm_pii_tagging": "false",
     "pii_llm_endpoint": DEFAULT_PII_LLM_ENDPOINT,
     "run_id": "",

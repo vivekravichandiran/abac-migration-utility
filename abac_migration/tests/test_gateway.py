@@ -17,6 +17,7 @@ subsequent idempotent rerun failed 100% of the time until this fix.
 """
 from __future__ import annotations
 
+from ..uc_gateway.access_control_client import AccessControlClientError
 from ..uc_gateway.gateway import DatabricksUnityCatalogGateway
 from ..uc_gateway.models import MatchColumn, PolicySpec, TableRef
 
@@ -312,3 +313,106 @@ def test_set_column_tags_uses_alter_materialized_view():
     )
 
     assert executor.statements == ["ALTER MATERIALIZED VIEW `cat`.`sch`.`t1` ALTER COLUMN `ssn` SET TAGS ('abac_rls_cat_sch_rf_dept')"]
+
+
+# ---------------------------------------------------------------------------
+# grant_tag_principals() / self._ac_client (§7.4 point 6): the one gateway
+# method that is real REST (Account Access Control Proxy), not SQL over
+# `_executor` - see access_control_client.py's module docstring for the
+# confirmed-live mechanics this wraps. `_StubExecutor` above has neither
+# `.host` nor `.token`, so every test in this section builds its own
+# executor stand-in as needed.
+# ---------------------------------------------------------------------------
+
+class _ExecutorWithHostAndToken(_StubExecutor):
+    """Mirrors what every real executor (ResilientDatabricksSQL, per
+    sql_statement_client.py / job_notebook_source.py) actually exposes -
+    plain `.host`/`.token` attributes - which is all
+    DatabricksUnityCatalogGateway.__init__ needs to opportunistically build
+    a real `_ac_client`."""
+
+    def __init__(self):
+        super().__init__(rows=[])
+        self.host = "https://example.databricks.net"
+        self.token = "fake-token"
+
+
+def test_ac_client_is_none_when_executor_lacks_host_and_token():
+    # _StubExecutor (used by every other test in this file) has neither
+    # attribute - the common case for the FakeUnityCatalogGateway-backed
+    # unit test suite, and any executor shape this project hasn't seen yet.
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+    assert gateway._ac_client is None
+
+
+def test_ac_client_is_constructed_when_executor_has_host_and_token():
+    gateway = DatabricksUnityCatalogGateway(_ExecutorWithHostAndToken())
+    assert gateway._ac_client is not None
+    assert gateway._ac_client.host == "https://example.databricks.net"
+
+
+def test_grant_tag_principals_dry_run_never_touches_ac_client():
+    gateway = DatabricksUnityCatalogGateway(_ExecutorWithHostAndToken())
+    gateway._ac_client = None  # even with no client at all, dry_run must short-circuit first
+
+    result = gateway.grant_tag_principals(
+        "abac_rls_cat_sch_fn", ["servicePrincipals/spn-1"], "roles/tagPolicy.assigner", dry_run=True,
+    )
+
+    assert result.status == "WOULD_GRANT"
+    assert result.tag_key == "abac_rls_cat_sch_fn"
+
+
+def test_grant_tag_principals_fails_gracefully_with_no_ac_client():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))  # no host/token -> _ac_client is None
+
+    result = gateway.grant_tag_principals(
+        "abac_rls_cat_sch_fn", ["servicePrincipals/spn-1"], "roles/tagPolicy.assigner", dry_run=False,
+    )
+
+    assert result.status == "FAILED"
+    assert result.error_code == "ACCESS_CONTROL_CLIENT_UNAVAILABLE"
+
+
+class _FakeAcClient:
+    def __init__(self, status=None, error=None):
+        self._status = status
+        self._error = error
+        self.calls = []
+
+    def grant_tag_role(self, tag_key, principals, role):
+        self.calls.append((tag_key, list(principals), role))
+        if self._error is not None:
+            raise self._error
+        return self._status
+
+
+def test_grant_tag_principals_returns_status_from_ac_client_on_success():
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+    gateway._ac_client = _FakeAcClient(status="GRANTED")
+
+    result = gateway.grant_tag_principals(
+        "abac_rls_cat_sch_fn", ["servicePrincipals/spn-1"], "roles/tagPolicy.assigner", dry_run=False,
+    )
+
+    assert result.status == "GRANTED"
+    assert result.tag_key == "abac_rls_cat_sch_fn"
+    assert result.principals == ["servicePrincipals/spn-1"]
+    assert result.role == "roles/tagPolicy.assigner"
+    assert gateway._ac_client.calls == [("abac_rls_cat_sch_fn", ["servicePrincipals/spn-1"], "roles/tagPolicy.assigner")]
+
+
+def test_grant_tag_principals_converts_client_error_to_failed_result_not_a_raise():
+    # A grant failure (real 400 "ServicePrincipal not found", etc.) must
+    # never propagate as an exception - `_run_migration`/`TagProvisioner`
+    # rely on always getting a TagGrantResult back.
+    gateway = DatabricksUnityCatalogGateway(_StubExecutor(rows=[]))
+    gateway._ac_client = _FakeAcClient(error=AccessControlClientError("SPN_NOT_FOUND", "ServicePrincipal not found"))
+
+    result = gateway.grant_tag_principals(
+        "abac_rls_cat_sch_fn", ["servicePrincipals/spn-1"], "roles/tagPolicy.assigner", dry_run=False,
+    )
+
+    assert result.status == "FAILED"
+    assert result.error_code == "SPN_NOT_FOUND"
+    assert result.error_message == "ServicePrincipal not found"
