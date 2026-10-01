@@ -798,6 +798,7 @@ and report **per row-filter / per masked-column**, exactly as scenarios
 | Condition | Eligibility | Reason code |
 |---|---|---|
 | No row filter AND no column masks | NOT_ELIGIBLE | `NO_LEGACY_SECURITY_FOUND` |
+| Describing this one table's security state fails with `PERMISSION_DENIED`/`SAMPLE_TABLE_PERMISSIONS` (identity lacks SELECT/MODIFY, or it's a Databricks-managed `samples` table), `FEDERATION_UNREACHABLE` (Lakehouse Federation table behind an unreachable external connection), or `UNSUPPORTED_DATA_SOURCE` (the SQL warehouse's runtime has no connector registered for this securable's provider at all, e.g. a Vector Search index — independent of reachability or permissions) — caught in `build_inventory_record`'s except branch, never `_evaluate_eligibility`; doesn't abort inventory for the rest of the tables in scope. The raw exception text (`str(exc)`) is stashed in `row_filter_expression_text` — always `""` on this early-return path otherwise, so no schema change needed to preserve it for the audit trail | NOT_ELIGIBLE | `PERMISSION_DENIED` / `FEDERATION_UNREACHABLE` / `UNSUPPORTED_DATA_SOURCE` |
 | Table type unsupported for ABAC policies — `SUPPORTED_TABLE_TYPES = {MANAGED, EXTERNAL, STREAMING_TABLE, MATERIALIZED_VIEW}` (all confirmed live 2026-09-15, see §16 item 2; only plain `VIEW` remains excluded — no underlying storage to attach a row filter/mask to) | NOT_ELIGIBLE | `UNSUPPORTED_TABLE_TYPE` |
 | Everything else (table is *attempted*; per-object outcome, including a missing function or a conflicting policy on any one object, is decided by the plugins during `convert_table()` — `SOURCE_FUNCTION_UNAVAILABLE`/`EXISTING_ABAC_POLICY_CONFLICT` are now per-object `ConversionStepResult` outcomes, not table-level inventory reasons) | ELIGIBLE | — |
 
@@ -939,6 +940,43 @@ Output shape mirrors the doc's example exactly:
   `SOURCE_FUNCTION_INCOMPATIBLE`, `POLICY_CREATE_FAILED`,
   `POLICY_VERIFY_FAILED`, `EXISTING_ABAC_POLICY_CONFLICT`,
   `LEGACY_REMOVAL_FAILED`, `FINAL_STATE_VERIFY_FAILED`, `PERMISSION_DENIED`,
+  `FEDERATION_UNREACHABLE` (confirmed live 2026-09-30 — a Lakehouse
+  Federation catalog/schema/table behind an external connection, e.g. to
+  Postgres via `CREATE FOREIGN CATALOG ... USING CONNECTION ...`, that
+  Unity Catalog can't currently reach fails `SHOW SCHEMAS`/`SHOW TABLES`/
+  `DESCRIBE TABLE EXTENDED` with `FAILED_JDBC.CONNECTION`; a federated
+  object can never be a valid ABAC/governed-tags target regardless of
+  connectivity — no UC-managed storage on our side to attach a row
+  filter/mask to — so `is_federation_unreachable()` skips it gracefully
+  for EVERY `scope_type` (unlike `PERMISSION_DENIED`, which only skips for
+  the auto-discovered ALL_CATALOGS/ALL_SCHEMAS scopes) at whichever layer
+  the error actually surfaces: whole catalog/schema in `scope_resolver.py`,
+  or one already-listed table in `inventory_manager.py`. Deliberately
+  reactive-only, by design decision (2026-09-30): no extra probe query
+  (e.g. a confirmatory `information_schema.tables`/`DESCRIBE DETAIL`
+  lookup) is fired to proactively identify a federated/foreign table -
+  every table gets exactly the same one `DESCRIBE TABLE EXTENDED` call
+  it always did; if it fails, skip + record, otherwise proceed exactly as
+  before. Known consequence, accepted as a v1 limitation rather than
+  fixed: a *reachable* federated table never raises this error at all -
+  Databricks docs confirm `DESCRIBE TABLE EXTENDED`'s `Type` field reports
+  `EXTERNAL` for a federated table too (confirmed for HMS/Glue federation,
+  "mimics hive_metastore behavior"; not independently live-confirmed for
+  Connection-based federation, e.g. Postgres/MySQL/Snowflake) - so it
+  would currently pass `SUPPORTED_TABLE_TYPES` and be marked `ELIGIBLE`),
+  `UNSUPPORTED_DATA_SOURCE` (confirmed live 2026-09-30, against a real
+  pre-existing Vector Search index registered in Unity Catalog as a
+  `FOREIGN` table, `ril_insurance.rag.docindex` - distinct from
+  `FEDERATION_UNREACHABLE`: this isn't about connectivity to an external
+  system at all, it's that the SQL warehouse's Spark runtime has no
+  connector registered for the securable's provider, so even
+  `DESCRIBE TABLE EXTENDED` fails outright with
+  `[DATA_SOURCE_NOT_FOUND] Failed to find the data source: unsupported...`,
+  independent of permissions. Same treatment as `FEDERATION_UNREACHABLE`:
+  `is_unsupported_data_source()` skips it gracefully for EVERY
+  `scope_type`, at whichever layer the error surfaces - no new probe
+  query, reuses the one `DESCRIBE TABLE EXTENDED`/`SHOW SCHEMAS`/
+  `SHOW TABLES` call every securable already gets),
   `UNSUPPORTED_TABLE_TYPE`, `TRANSIENT_API_ERROR`,
   `RLS_TAG_COLLISION_UNRESOLVABLE` (§7.4 point 2 — 2+ columns of one table
   would need the identical bare row-filter tag key; no value is minted to

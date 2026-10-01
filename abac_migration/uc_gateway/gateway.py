@@ -79,6 +79,60 @@ def is_permission_denied(exc: "UCGatewayError") -> bool:
         marker in (exc.message or "") for marker in _ACCESS_NOT_APPLICABLE_MARKERS
     )
 
+
+# Confirmed live (2026-09-30): a Lakehouse Federation ("foreign") catalog -
+# e.g. one created via `CREATE FOREIGN CATALOG ... USING CONNECTION ...`
+# pointing at an external PostgreSQL source - fails `SHOW SCHEMAS IN`/
+# `SHOW TABLES IN` with this error whenever Databricks can't open a live
+# JDBC connection to the source (network ACL, expired credentials, source
+# down, etc.): error_code="BAD_REQUEST" with "FAILED_JDBC.CONNECTION"
+# embedded in the message, e.g. "Failed JDBC jdbc:postgresql:... Failed to
+# connect to the database. SQLSTATE: HV000".
+#
+# Federated tables can never be a valid ABAC/governed-tags migration target
+# regardless of connectivity - there is no UC-managed storage on our side to
+# attach a row filter/column mask to, the source system owns that. So unlike
+# `is_permission_denied` (only swallowed for the auto-discovered
+# ALL_CATALOGS/ALL_SCHEMAS scopes - a permission gap on an explicitly
+# requested catalog is a real misconfiguration the caller should see), this
+# is skipped for every scope_type: an explicitly-listed federated catalog is
+# still never something this tool can act on.
+FEDERATION_CONNECTION_MARKER = "FAILED_JDBC"
+
+
+def is_federation_unreachable(exc: "UCGatewayError") -> bool:
+    """True when a UCGatewayError means "this securable sits behind a live
+    external connection (Lakehouse Federation) that Unity Catalog could not
+    reach" - never actionable by this tool, independent of the run-as
+    identity's permissions. Same message-substring caveat as
+    `is_permission_denied`: the marker can surface embedded in the message
+    text rather than as the literal error_code."""
+    return exc.error_code == FEDERATION_CONNECTION_MARKER or FEDERATION_CONNECTION_MARKER in (exc.message or "")
+
+# Confirmed live (2026-09-30, against a real pre-existing FOREIGN-type table,
+# `ril_insurance.rag.docindex` - a Vector Search index registered in Unity
+# Catalog, not a Lakehouse Federation JDBC catalog) via DESCRIBE TABLE
+# EXTENDED: Unity Catalog is happy to list this table (it's FOREIGN, not
+# permission-denied), but the SQL warehouse's Spark runtime has no connector
+# registered for its provider, so DESCRIBE TABLE EXTENDED itself fails
+# outright. Same shape as FEDERATION_CONNECTION_MARKER - "this securable
+# can never be migrated/inspected by this tool, independent of the run-as
+# identity's permissions" - skipped for every scope_type, same as federation-
+# unreachable.
+UNSUPPORTED_DATA_SOURCE_MARKER = "DATA_SOURCE_NOT_FOUND"
+
+
+def is_unsupported_data_source(exc: "UCGatewayError") -> bool:
+    """True when a UCGatewayError means "this securable is backed by a
+    provider/connector the SQL warehouse's runtime doesn't have registered"
+    (e.g. a Vector Search index, or any other FOREIGN-type table whose
+    connector package isn't available) - never actionable by this tool,
+    independent of the run-as identity's permissions. Same message-substring
+    caveat as `is_permission_denied`/`is_federation_unreachable`: the marker
+    can surface embedded in the message text rather than as the literal
+    error_code."""
+    return exc.error_code == UNSUPPORTED_DATA_SOURCE_MARKER or UNSUPPORTED_DATA_SOURCE_MARKER in (exc.message or "")
+
 # §7.4 point 4: a governed-tag value that was JUST added via
 # ALTER GOVERNED TAG ... SET VALUES can take ~20-30s to propagate to the
 # policy compiler ("Invalid tag value ..."). Confirmed live (2026-08-25,

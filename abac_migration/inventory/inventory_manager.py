@@ -13,7 +13,13 @@ from ..config.models import DEFAULT_PII_LLM_ENDPOINT
 from ..discovery.mask_discovery import discover_column_masks
 from ..discovery.rls_discovery import discover_row_filter
 from ..migration.policy_strategy import PolicyStrategy, TableBasedPolicyStrategy
-from ..uc_gateway.gateway import UCGatewayError, UnityCatalogGateway, is_permission_denied
+from ..uc_gateway.gateway import (
+    UCGatewayError,
+    UnityCatalogGateway,
+    is_federation_unreachable,
+    is_permission_denied,
+    is_unsupported_data_source,
+)
 from ..uc_gateway.models import TableRef
 
 # §16 item 2: STREAMING_TABLE confirmed live (2026-09-15, ril_full_access_test)
@@ -92,19 +98,45 @@ def build_inventory_record(
             + [m.policy_def.name for m in existing_masks]
         )
     except UCGatewayError as exc:
-        if not is_permission_denied(exc):
-            raise
         # A catalog/schema can be listable (SHOW SCHEMAS/TABLES only needs
         # USE CATALOG/USE SCHEMA) while an individual table still denies
-        # SELECT/MODIFY to this identity - don't let one inaccessible table
-        # abort inventory for every other table in scope.
+        # SELECT/MODIFY to this identity, or - confirmed live 2026-09-30 -
+        # is itself a Lakehouse Federation table whose external connection
+        # (e.g. to a Postgres source) can't be reached right now (or ever,
+        # for governed-tags purposes - there's no UC-managed storage on our
+        # side to attach a row filter/mask to), or - also confirmed live
+        # 2026-09-30, against a real pre-existing Vector Search index
+        # registered as a FOREIGN table - is backed by a provider/connector
+        # the SQL warehouse's runtime doesn't have registered at all, so
+        # even DESCRIBE TABLE EXTENDED fails outright regardless of
+        # permissions. `scope_resolver` already skips a WHOLE catalog/schema
+        # this way when it can't even be listed (§scope_resolver.py); this
+        # is the equivalent per-table guard for when the catalog/schema
+        # listed fine but describing THIS one table's security state is
+        # what fails. Either way: don't let one bad table abort inventory
+        # for every other table in scope - record it (still visible in the
+        # audit trail) as NOT_ELIGIBLE instead, and never attempt any DDL
+        # against it. The raw exception text is stashed in
+        # `row_filter_expression_text` rather than a new column: on this
+        # exact (early-return, pre-`describe_table_security` success) path
+        # that field is otherwise always "" anyway (there was never a real
+        # row filter to read), so reusing it loses nothing and needs no
+        # schema change - deliberate choice over adding a column, 2026-09-30.
+        if is_permission_denied(exc):
+            reason = "PERMISSION_DENIED"
+        elif is_federation_unreachable(exc):
+            reason = "FEDERATION_UNREACHABLE"
+        elif is_unsupported_data_source(exc):
+            reason = "UNSUPPORTED_DATA_SOURCE"
+        else:
+            raise
         return InventoryRecord(
             run_id=run_id, inventoried_at=dt.datetime.utcnow(),
             catalog=table.catalog, schema=table.schema, table=table.table, full_name=table.full_name,
             table_type="UNKNOWN", has_row_filter=False, row_filter_function=None, row_filter_columns=[],
-            row_filter_expression_text="", has_column_masks=False, column_masks=[],
+            row_filter_expression_text=str(exc), has_column_masks=False, column_masks=[],
             has_existing_abac_policy=False, existing_abac_policy_names=[],
-            migration_eligibility="NOT_ELIGIBLE", eligibility_reason="PERMISSION_DENIED",
+            migration_eligibility="NOT_ELIGIBLE", eligibility_reason=reason,
         )
 
     eligibility, reason = _evaluate_eligibility(state, existing_policy_names)

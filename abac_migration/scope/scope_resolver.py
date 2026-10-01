@@ -14,8 +14,59 @@ from __future__ import annotations
 import re
 
 from ..config.models import RunConfig, ScopeType
-from ..uc_gateway.gateway import UCGatewayError, UnityCatalogGateway, is_permission_denied
+from ..uc_gateway.gateway import (
+    UCGatewayError,
+    UnityCatalogGateway,
+    is_federation_unreachable,
+    is_permission_denied,
+    is_unsupported_data_source,
+)
 from ..uc_gateway.models import TableRef
+
+
+def _skip_or_raise(exc: UCGatewayError, securable: str, scope_type: ScopeType) -> bool:
+    """True means "skip this catalog/schema, it's not a valid migration
+    target" - False is never returned, the caller re-raises instead.
+
+    Three independent reasons to skip, with different scope_type gating:
+    - `is_permission_denied`: only for the *auto-discovered* ALL_CATALOGS/
+      ALL_SCHEMAS scopes (SHOW CATALOGS surfaces every catalog in the
+      metastore regardless of USE CATALOG grants, §scope_resolver docstring
+      below). A permission gap on an *explicitly requested* catalog is a
+      real misconfiguration the caller should see, not something to hide.
+    - `is_federation_unreachable`: for EVERY scope_type. A Lakehouse
+      Federation catalog/schema behind an unreachable external connection
+      can never be a valid ABAC target (no UC-managed storage on our side to
+      attach a row filter/mask to) - explicitly listing it doesn't change
+      that, so there's nothing useful the caller gains from seeing this
+      raised as a hard failure that aborts the whole run.
+    - `is_unsupported_data_source`: for EVERY scope_type, same reasoning as
+      `is_federation_unreachable` - confirmed live (2026-09-30) against a
+      real pre-existing Vector Search index registered as a FOREIGN table:
+      the SQL warehouse's runtime has no connector for its provider at all,
+      so even a listing/describe call fails outright, independent of
+      permissions.
+    """
+    if is_federation_unreachable(exc):
+        print(
+            f"[scope_resolver] Skipping {securable!r}: unreachable via Lakehouse "
+            f"Federation ({exc.error_code}) - not a valid ABAC/governed-tags "
+            f"migration target, reachable or not. No commands were issued "
+            f"against it. ({exc.message})"
+        )
+        return True
+    if is_unsupported_data_source(exc):
+        print(
+            f"[scope_resolver] Skipping {securable!r}: unsupported data source "
+            f"({exc.error_code}) - the SQL warehouse has no connector for this "
+            f"securable's provider (e.g. a Vector Search index), not a valid "
+            f"ABAC/governed-tags migration target. No commands were issued "
+            f"against it. ({exc.message})"
+        )
+        return True
+    if is_permission_denied(exc) and scope_type in (ScopeType.ALL_CATALOGS, ScopeType.ALL_SCHEMAS):
+        return True
+    return False
 
 
 def resolve_scope(config: RunConfig, uc: UnityCatalogGateway) -> list:
@@ -51,7 +102,7 @@ def resolve_scope(config: RunConfig, uc: UnityCatalogGateway) -> list:
             try:
                 schema_names = uc.list_schemas(catalog)
             except UCGatewayError as exc:
-                if is_permission_denied(exc) and config.scope_type in (ScopeType.ALL_CATALOGS, ScopeType.ALL_SCHEMAS):
+                if _skip_or_raise(exc, catalog, config.scope_type):
                     continue
                 raise
 
@@ -61,7 +112,7 @@ def resolve_scope(config: RunConfig, uc: UnityCatalogGateway) -> list:
             try:
                 result.extend(uc.list_tables(catalog, schema))
             except UCGatewayError as exc:
-                if is_permission_denied(exc) and config.scope_type in (ScopeType.ALL_CATALOGS, ScopeType.ALL_SCHEMAS):
+                if _skip_or_raise(exc, f"{catalog}.{schema}", config.scope_type):
                     continue
                 raise
 

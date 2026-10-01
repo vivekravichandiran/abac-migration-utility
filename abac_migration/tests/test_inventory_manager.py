@@ -152,6 +152,11 @@ def test_permission_denied_table_is_not_eligible_and_does_not_raise():
 
     assert record.migration_eligibility == "NOT_ELIGIBLE"
     assert record.eligibility_reason == "PERMISSION_DENIED"
+    # The raw exception text is stashed in `row_filter_expression_text`
+    # (always "" on this path otherwise, see inventory_manager.py comment)
+    # rather than a new column - preserves it for the audit trail without a
+    # schema change.
+    assert "no_select_grant" in record.row_filter_expression_text
 
 
 def test_sample_catalog_table_is_not_eligible_and_does_not_raise():
@@ -171,6 +176,65 @@ def test_sample_catalog_table_is_not_eligible_and_does_not_raise():
 
     assert record.migration_eligibility == "NOT_ELIGIBLE"
     assert record.eligibility_reason == "PERMISSION_DENIED"
+
+
+def test_unreachable_federated_table_is_not_eligible_and_does_not_raise():
+    """Confirmed live 2026-09-30: `DESCRIBE TABLE EXTENDED` on a Lakehouse
+    Federation table can itself require a live JDBC connection to the
+    external source (e.g. to fetch synced comments) and fail with
+    FAILED_JDBC.CONNECTION even when the catalog/schema *listing* that
+    found this table succeeded. One unreachable federated table must not
+    abort inventory for every other table in scope, and it can never be a
+    valid ABAC target anyway (no UC-managed storage to attach a row
+    filter/mask to) - so it's recorded NOT_ELIGIBLE, not retried, not
+    written to."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "federated_pg_table")
+    uc.register_table(table)
+    uc.set_fault(
+        "describe_table_security",
+        UCGatewayError(
+            "BAD_REQUEST",
+            "[FAILED_JDBC.CONNECTION] Failed JDBC jdbc:postgresql:*(redacted) on the operation: "
+            "Failed to connect to the database. SQLSTATE: HV000",
+        ),
+    )
+
+    record = build_inventory_record(table, uc, run_id="run-1")
+
+    assert record.migration_eligibility == "NOT_ELIGIBLE"
+    assert record.eligibility_reason == "FEDERATION_UNREACHABLE"
+    assert "FAILED_JDBC.CONNECTION" in record.row_filter_expression_text
+    assert "jdbc:postgresql" in record.row_filter_expression_text
+
+
+def test_unsupported_data_source_table_is_not_eligible_and_does_not_raise():
+    """Confirmed live 2026-09-30 against a real pre-existing Vector Search
+    index registered in Unity Catalog as a FOREIGN table
+    (`ril_insurance.rag.docindex`): `DESCRIBE TABLE EXTENDED` fails outright
+    with DATA_SOURCE_NOT_FOUND because the SQL warehouse's runtime has no
+    connector for its provider at all - independent of permissions, and
+    unlike FEDERATION_UNREACHABLE this isn't even about reachability. Same
+    treatment: recorded NOT_ELIGIBLE, not retried, never written to, and
+    does not abort inventory for every other table in scope."""
+    uc = FakeUnityCatalogGateway()
+    table = TableRef("cat", "schema", "vector_search_index")
+    uc.register_table(table)
+    uc.set_fault(
+        "describe_table_security",
+        UCGatewayError(
+            "BAD_REQUEST",
+            "[DATA_SOURCE_NOT_FOUND] Failed to find the data source: unsupported. Make sure the "
+            "provider name is correct and the package is properly registered and compatible with "
+            "your Spark version. SQLSTATE: 42K02",
+        ),
+    )
+
+    record = build_inventory_record(table, uc, run_id="run-1")
+
+    assert record.migration_eligibility == "NOT_ELIGIBLE"
+    assert record.eligibility_reason == "UNSUPPORTED_DATA_SOURCE"
+    assert "DATA_SOURCE_NOT_FOUND" in record.row_filter_expression_text
 
 
 def test_non_permission_error_still_propagates_from_inventory():

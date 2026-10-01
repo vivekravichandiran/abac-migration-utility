@@ -8,7 +8,9 @@ syncs the `abac_migration` Python package to the workspace as plain files
 runs it via Databricks Jobs (serverless compute). See
 `abac_migration/DESIGN.md` for the full architecture/design spec — this
 file is a practical, task-oriented guide focused on **how to run the tool
-and what each mode does**.
+and what each mode does**. See `CHANGELOG.md` for a dated, per-release
+history of every change (what/why, plus test evidence) — add a new entry
+there for every change you make, before merging.
 
 **Deployment model.** `databricks bundle deploy` syncs this repo straight to
 the workspace (respecting `.gitignore` + `databricks.yml`'s `sync.exclude`)
