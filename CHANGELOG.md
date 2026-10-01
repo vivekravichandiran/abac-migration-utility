@@ -26,6 +26,46 @@ release hotfix once this tool has a first tagged release.
 
 Nothing yet.
 
+## [0.12.0] - 2026-10-01
+
+Widened the per-table inventory error handling introduced in [0.11.0]
+(below) from a whitelist of three named reasons into a genuine catch-all:
+**any** `UCGatewayError` on one table - including a kind this tool has
+never specifically seen or named before - is now recorded as `NOT_ELIGIBLE`
+and skipped, never re-raised. Explicit product decision: "one table's
+failure must never impact other tables," full stop, not just for the
+specific error shapes we happen to have already diagnosed.
+
+### Changed
+- `inventory_manager.py`: `build_inventory_record`'s except branch no
+  longer ends with `else: raise` for anything outside
+  `PERMISSION_DENIED`/`SAMPLE_TABLE_PERMISSIONS`/`FEDERATION_UNREACHABLE`/
+  `UNSUPPORTED_DATA_SOURCE` - it now falls through to a new
+  `eligibility_reason=UNKNOWN_GATEWAY_ERROR` instead. The raw exception
+  text is still captured in `row_filter_expression_text` (same mechanism
+  as the three named reasons), so nothing is silently swallowed - it's
+  fully visible in the audit trail for investigation, just never allowed
+  to abort the run. Deliberately still scoped to `UCGatewayError`
+  specifically (the one documented seam to Databricks), not a bare
+  `except Exception` - a bug in this tool's own code should still crash
+  loudly.
+- **Not changed in this pass**: `scope_resolver.py`'s catalog/schema-level
+  `_skip_or_raise` remains a selective whitelist (`FEDERATION_UNREACHABLE`/
+  `UNSUPPORTED_DATA_SOURCE` for every scope_type; `PERMISSION_DENIED` only
+  for auto-discovered `ALL_CATALOGS`/`ALL_SCHEMAS`) - this change was
+  scoped to the per-*table* inventory path only, per the exact ask. An
+  unanticipated error while *listing* a catalog/schema still aborts scope
+  resolution before inventory starts; extending the same catch-all there
+  is a candidate follow-up if wanted.
+
+### Verification
+- Updated `test_non_permission_error_still_propagates_from_inventory` (which
+  asserted the old `raise`-on-anything-else behavior) into
+  `test_unanticipated_gateway_error_is_not_eligible_and_does_not_raise`,
+  asserting the new catch-all instead.
+- Full unit suite: 224/224 passing (no new test count change - existing
+  test repurposed rather than duplicated).
+
 ## [0.11.0] - 2026-09-30
 
 Fixed a live crash: a Lakehouse Federation catalog/schema/table (e.g.

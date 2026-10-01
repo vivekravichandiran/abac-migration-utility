@@ -798,7 +798,7 @@ and report **per row-filter / per masked-column**, exactly as scenarios
 | Condition | Eligibility | Reason code |
 |---|---|---|
 | No row filter AND no column masks | NOT_ELIGIBLE | `NO_LEGACY_SECURITY_FOUND` |
-| Describing this one table's security state fails with `PERMISSION_DENIED`/`SAMPLE_TABLE_PERMISSIONS` (identity lacks SELECT/MODIFY, or it's a Databricks-managed `samples` table), `FEDERATION_UNREACHABLE` (Lakehouse Federation table behind an unreachable external connection), or `UNSUPPORTED_DATA_SOURCE` (the SQL warehouse's runtime has no connector registered for this securable's provider at all, e.g. a Vector Search index — independent of reachability or permissions) — caught in `build_inventory_record`'s except branch, never `_evaluate_eligibility`; doesn't abort inventory for the rest of the tables in scope. The raw exception text (`str(exc)`) is stashed in `row_filter_expression_text` — always `""` on this early-return path otherwise, so no schema change needed to preserve it for the audit trail | NOT_ELIGIBLE | `PERMISSION_DENIED` / `FEDERATION_UNREACHABLE` / `UNSUPPORTED_DATA_SOURCE` |
+| Describing this one table's security state fails with ANY `UCGatewayError` — `PERMISSION_DENIED`/`SAMPLE_TABLE_PERMISSIONS` (identity lacks SELECT/MODIFY, or it's a Databricks-managed `samples` table), `FEDERATION_UNREACHABLE` (Lakehouse Federation table behind an unreachable external connection), `UNSUPPORTED_DATA_SOURCE` (the SQL warehouse's runtime has no connector registered for this securable's provider at all, e.g. a Vector Search index), or any other/unanticipated gateway error (`UNKNOWN_GATEWAY_ERROR`) — caught in `build_inventory_record`'s except branch as a genuine catch-all (explicit decision 2026-10-01: one table's failure, of ANY kind, must never abort inventory for every other table in scope), never `_evaluate_eligibility`. The raw exception text (`str(exc)`) is stashed in `row_filter_expression_text` — always `""` on this early-return path otherwise, so no schema change needed to preserve it for the audit trail. Deliberately scoped to `UCGatewayError` only, not a bare `except Exception` — a bug in this tool's own code should still crash loudly | NOT_ELIGIBLE | `PERMISSION_DENIED` / `FEDERATION_UNREACHABLE` / `UNSUPPORTED_DATA_SOURCE` / `UNKNOWN_GATEWAY_ERROR` |
 | Table type unsupported for ABAC policies — `SUPPORTED_TABLE_TYPES = {MANAGED, EXTERNAL, STREAMING_TABLE, MATERIALIZED_VIEW}` (all confirmed live 2026-09-15, see §16 item 2; only plain `VIEW` remains excluded — no underlying storage to attach a row filter/mask to) | NOT_ELIGIBLE | `UNSUPPORTED_TABLE_TYPE` |
 | Everything else (table is *attempted*; per-object outcome, including a missing function or a conflicting policy on any one object, is decided by the plugins during `convert_table()` — `SOURCE_FUNCTION_UNAVAILABLE`/`EXISTING_ABAC_POLICY_CONFLICT` are now per-object `ConversionStepResult` outcomes, not table-level inventory reasons) | ELIGIBLE | — |
 
@@ -977,6 +977,16 @@ Output shape mirrors the doc's example exactly:
   `scope_type`, at whichever layer the error surfaces - no new probe
   query, reuses the one `DESCRIBE TABLE EXTENDED`/`SHOW SCHEMAS`/
   `SHOW TABLES` call every securable already gets),
+  `UNKNOWN_GATEWAY_ERROR` (explicit decision 2026-10-01: `build_inventory_
+  record`'s except branch is a genuine catch-all for every `UCGatewayError`,
+  not a whitelist of the three named reasons above - any OTHER/future/
+  unanticipated gateway error on one table falls through to this reason
+  instead of re-raising, so one table's failure, of any kind, never aborts
+  inventory for every other table in scope. Still fully recorded - raw
+  `str(exc)` in `row_filter_expression_text` - and never DDL'd against.
+  Deliberately scoped to `UCGatewayError` specifically, not a bare
+  `except Exception`: a bug in this tool's own code should still crash
+  loudly, not be silently absorbed here),
   `UNSUPPORTED_TABLE_TYPE`, `TRANSIENT_API_ERROR`,
   `RLS_TAG_COLLISION_UNRESOLVABLE` (§7.4 point 2 — 2+ columns of one table
   would need the identical bare row-filter tag key; no value is minted to

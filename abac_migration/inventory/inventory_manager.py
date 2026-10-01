@@ -122,6 +122,24 @@ def build_inventory_record(
         # that field is otherwise always "" anyway (there was never a real
         # row filter to read), so reusing it loses nothing and needs no
         # schema change - deliberate choice over adding a column, 2026-09-30.
+        #
+        # Explicit product decision (2026-10-01): this is now a genuine
+        # catch-all for every `UCGatewayError`, not a whitelist of three
+        # known reasons - "one table's failure must never take down
+        # inventory for every other table in scope" applies regardless of
+        # whether we've seen this particular error before. The three named
+        # reasons above still get their specific, searchable
+        # `eligibility_reason` for anything we *have* identified; any other/
+        # future/unanticipated `UCGatewayError` instead falls through to
+        # `UNKNOWN_GATEWAY_ERROR` - still recorded (not silently dropped:
+        # `migration_engine.py`'s per-run summary and this exact row's
+        # `row_filter_expression_text` carry the full raw error for
+        # investigation), still never DDL'd against, but never aborts the
+        # run. Deliberately scoped to `UCGatewayError` specifically (the
+        # one documented seam to Databricks, §5/§1) rather than a bare
+        # `except Exception` - a bug in this tool's own code (e.g. an
+        # `AttributeError`) should still crash loudly, not be swallowed
+        # here.
         if is_permission_denied(exc):
             reason = "PERMISSION_DENIED"
         elif is_federation_unreachable(exc):
@@ -129,7 +147,7 @@ def build_inventory_record(
         elif is_unsupported_data_source(exc):
             reason = "UNSUPPORTED_DATA_SOURCE"
         else:
-            raise
+            reason = "UNKNOWN_GATEWAY_ERROR"
         return InventoryRecord(
             run_id=run_id, inventoried_at=dt.datetime.utcnow(),
             catalog=table.catalog, schema=table.schema, table=table.table, full_name=table.full_name,

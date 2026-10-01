@@ -237,17 +237,23 @@ def test_unsupported_data_source_table_is_not_eligible_and_does_not_raise():
     assert "DATA_SOURCE_NOT_FOUND" in record.row_filter_expression_text
 
 
-def test_non_permission_error_still_propagates_from_inventory():
+def test_unanticipated_gateway_error_is_not_eligible_and_does_not_raise():
+    """Explicit product decision (2026-10-01): this is a genuine catch-all,
+    not a whitelist of three known reasons - one table's failure (of ANY
+    UCGatewayError flavor, including one we've never specifically named)
+    must never abort inventory for every other table in scope. Falls
+    through to UNKNOWN_GATEWAY_ERROR, still fully recorded (raw error text
+    in row_filter_expression_text) for investigation, never DDL'd against."""
     uc = FakeUnityCatalogGateway()
     table = TableRef("cat", "schema", "flaky")
     uc.register_table(table)
     uc.set_fault("describe_table_security", UCGatewayError("INTERNAL_ERROR", "transient backend failure"))
 
-    try:
-        build_inventory_record(table, uc, run_id="run-1")
-        assert False, "expected UCGatewayError to propagate"
-    except UCGatewayError:
-        pass
+    record = build_inventory_record(table, uc, run_id="run-1")
+
+    assert record.migration_eligibility == "NOT_ELIGIBLE"
+    assert record.eligibility_reason == "UNKNOWN_GATEWAY_ERROR"
+    assert "transient backend failure" in record.row_filter_expression_text
 
 
 # ---------------------------------------------------------------------------
